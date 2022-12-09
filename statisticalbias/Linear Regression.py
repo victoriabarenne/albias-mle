@@ -1,91 +1,153 @@
+import torch
+import torchvision
+import matplotlib.pyplot as plt
+from sklearn.linear_model import LinearRegression
+import random
+import copy
+import seaborn as sns
+import torchvision.datasets as datasets
 import numpy as np
 from IPython import embed
 import matplotlib.pyplot as plt
 from models import LinearRegressor
-import active_learners
-from active_learners import ActiveLearner, BoltzmanSampler, ProposalDistributionSampler
+from active_learners import ActiveLearner, BoltzmanSampler, ProposalDistributionSampler, RandomSampler
 from proposal_distributions import MyProposal, ProposalDistribution
-import random
-import seaborn as sns
-from datasets import sample_points
+from datasets import SinusoidalData2D
+from estimators import TrueEstimator, RpureEstimator, RlureEstimator, BiasedEstimator
+import pandas as pd
+from sklearn.metrics import mean_squared_error
 
-def simulate_bias(dataset, total_budget:list, al_learner: ActiveLearner, n_initial=1, plot=False):
-    n_pool=len(dataset)
-    bias= {"biased": np.zeros(len(total_budget)), "pure": np.zeros(len(total_budget)) , "lure": np.zeros(len(total_budget))}
-    lm_true=LinearRegressor(dataset)
-    R_hat = np.mean(lm_true.evaluate_test(dataset[:,0:-1].reshape(n_pool, -1), dataset[:,-1].reshape(-1,1)))
-
-    for i,M in enumerate(total_budget):
-        idx_al, probs_al= al_learner.query(M, n_initial=1, b=1)
-        dataset_al=dataset[idx_al,:]
-        loss_al= lm_true.evaluate_test(dataset_al[:,:-1],
-                                       dataset_al[:,-1].reshape(-1,1))
-        bias["biased"][i]= np.mean(loss_al)
-
-        w_pure = 1 / (n_pool * probs_al) + (M - np.arange(1, M + 1)) / n_pool
-        bias["pure"][i]= np.mean(w_pure* loss_al)
-
-        # if not isinstance(al_learner, ProposalDistributionSampler):
-        #     probs_al=np.flip(probs_al)
-        #     # for non Proposal distribution active learners, the probs output is: [1/(N-M+1), 1/(N-M+2),..., 1/(N-1), 1/N]
-        #     # so that np.mean(w_pure*loss)=np.mean(loss)
-        #     # for RLURE we need to have probs [1/N, 1/(N-1), ..., 1/(N-M+2), 1/(N-M+1)] as output so we can just flip the vector
-
-        w_lure = 1 + (n_pool-M) * (1/((n_pool - np.arange(1, M + 1) + 1)*probs_al) - 1) / (n_pool-np.arange(1, M+1))
-        bias["lure"][i]= np.mean(w_lure * loss_al)
-
-    bias["biased"], bias["pure"], bias["lure"]= bias["biased"]-R_hat, bias["pure"]-R_hat, bias["lure"]-R_hat
-
-    if plot==True:
-        sns.lineplot(x=total_budget, y=bias["biased"], label="Biased")
-        sns.lineplot(x=total_budget, y=bias["pure"], label="Rpure")
-        sns.lineplot(x=total_budget, y=bias["lure"], label="Rlure")
-        plt.title(f"Bias for all estimators with the {al_learner.__class__.__name__}")
-        plt.show()
-
-    return bias
-
-
-np.random.seed(1)
 N = 101
 m = 1
-M = 20
-dataset_pool = sample_points(N)
-plt.scatter(dataset_pool[:,0], dataset_pool[:,1])
-plt.show()
-my_regressor=LinearRegressor(dataset=dataset_pool)
-boltzman_learner= BoltzmanSampler(dataset=dataset_pool, model=my_regressor)
-my_proposal=MyProposal(hyperparameters=[0.1])
-proposal_learner= ProposalDistributionSampler(dataset=dataset_pool, model=None, proposal=my_proposal)
-total_budget=list(range(1,N))
+M = 10
+dataset_pool = SinusoidalData2D(n_points=N, random_state=1)
 
-bias_boltzman=simulate_bias(dataset_pool, total_budget, boltzman_learner, n_initial=1, plot=True)
-bias_proposal=simulate_bias(dataset_pool, total_budget, proposal_learner, n_initial=1, plot=True)
-embed()
+def figure1(M):
+    # True linear regression on the whole dataset
+    true_linear_regressor= LinearRegressor(dataset_pool)
+    true_linear_regressor.train(np.arange(0, dataset_pool.n_points))
+    true_linear_regressor.plot_regressor(label="True estimator on Dpool")
 
-def simulate_bias_average(dataset, total_budget, al_learner: ActiveLearner, n_iter=100, n_initial=1, plot=False):
-    average_bias= {"biased": np.zeros(len(total_budget)), "pure": np.zeros(len(total_budget)) , "lure": np.zeros(len(total_budget))}
+    #Rpure and Rlure acquisition weights
+    dataset_pool.restart()
+    my_proposal=MyProposal(hyperparameters=[0.1])
+    proposal_learner= ProposalDistributionSampler(dataset=dataset_pool, model=None, proposal=my_proposal)
+    acq_probs= proposal_learner.query(M)
+    dataset_pool.plot_labeled()
+    acq_weights_pure= RpureEstimator(dataset_pool, mean_squared_error).get_weights(acq_probs)
+    acq_weights_lure= RlureEstimator(dataset_pool, mean_squared_error).get_weights(acq_probs)
 
-    if not isinstance(al_learner, ProposalDistributionSampler):
-        print("Is not a proposal distribution sampler")
+    # Plotting regressors
+    linear_regressor= LinearRegressor(dataset_pool)
+    linear_regressor.train(dataset_pool.queries)
+    linear_regressor.plot_regressor(label="Unweighted estimator on AL points", show=False)
+    linear_regressor.train(dataset_pool.queries, weights= acq_weights_pure.squeeze())
+    linear_regressor.plot_regressor(label="Unbiased Rpure", show=False)
+    linear_regressor.train(dataset_pool.queries, weights= acq_weights_lure.squeeze())
+    linear_regressor.plot_regressor(label="Unbiased Rlure", show=False)
+    plt.title(f"Linear Regression trained on {M} actively sampled points")
+    plt.show()
+
+    # Creating a file with the weights to check everything is working well
+    y_true= dataset_pool.y[dataset_pool.queries]
+    y_pred= true_linear_regressor.predict(dataset_pool.queries)
+    loss = np.array([mean_squared_error(y_true[i], y_pred[i]) for i in range(0, len(y_true))]).reshape(-1,1)
+    weights= pd.DataFrame(np.concatenate([acq_probs, acq_weights_pure.reshape(-1,1), acq_weights_lure.reshape(-1,1), loss],
+                                         axis=1), columns=["Acquisition probability", "Rpure weights", "Rlure weights", "Loss"])
+    weights.to_csv(f"Weights_{M}samples.csv")
+
+
+def figure2(M, n_iter):
+    # True linear regression on the whole dataset
+    true_linear_regressor= LinearRegressor(dataset_pool)
+
+    # Linear regressor to train at each iteration
+    linear_regressor = LinearRegressor(dataset_pool)
+
+    #Rpure and Rlure
+    dataset_pool.restart()
+    my_proposal = MyProposal(hyperparameters=[0.1])
+    proposal_learner = ProposalDistributionSampler(dataset=dataset_pool, model=None, proposal=my_proposal)
+    y_predictions_biased, y_predictions_pure, y_predictions_lure= np.zeros(shape=(N,1)), np.zeros(shape=(N,1)), np.zeros(shape=(N,1))
+
+    for n in range(n_iter):
+        dataset_pool.restart()
+        acq_probs= proposal_learner.query(M)
+
+        acq_weights_pure= RpureEstimator(dataset_pool, mean_squared_error).get_weights(acq_probs)
+        acq_weights_lure= RlureEstimator(dataset_pool, mean_squared_error).get_weights(acq_probs)
+        linear_regressor.train(dataset_pool.queries)
+        y_predictions_biased+= linear_regressor.predict(np.arange(dataset_pool.n_points))
+        linear_regressor.train(dataset_pool.queries, acq_weights_pure)
+        y_predictions_pure += linear_regressor.predict(np.arange(dataset_pool.n_points))
+        linear_regressor.train(dataset_pool.queries, acq_weights_lure)
+        y_predictions_lure += linear_regressor.predict(np.arange(dataset_pool.n_points))
+
+    y_predictions_pure=y_predictions_pure/n_iter
+    y_predictions_lure=y_predictions_lure/n_iter
+    y_predictions_biased=y_predictions_biased/n_iter
+
+    dataset_pool.plot_data()
+    true_linear_regressor.plot_regressor(label="True estimator on Dpool")
+    sns.lineplot(x=dataset_pool.x.squeeze(), y=y_predictions_pure.squeeze(), label="Unbiased Rpure")
+    sns.lineplot(x=dataset_pool.x.squeeze(), y=y_predictions_lure.squeeze(), label="Unbiased Rlure")
+    sns.lineplot(x=dataset_pool.x.squeeze(), y=y_predictions_biased.squeeze(), label="Biased")
+    plt.title(f"Regressor averaged over {n_iter} iterations of sampling points")
+    plt.xlim(xmin=-1.5, xmax= 1.5)
+    plt.ylim(ymin=-0.5, ymax=2.5)
+    plt.show()
+
+
+def simulate_budget():
+    dataset_pool.restart()
+    true_linear_regressor= LinearRegressor(dataset_pool)
+    true_linear_regressor.train(np.arange(0, dataset_pool.n_points))
+
+    R_hat= TrueEstimator(dataset_pool, mean_squared_error).evaluate_risk(true_linear_regressor)
+    R_tilde= np.zeros(dataset_pool.n_points-1)
+    R_pure = np.zeros(dataset_pool.n_points-1)
+    R_lure = np.zeros(dataset_pool.n_points-1)
+
+    #Query 101 points
+    my_proposal = MyProposal(hyperparameters=[0.1])
+    proposal_learner = ProposalDistributionSampler(dataset=dataset_pool, model=None, proposal=my_proposal)
+    acq_probs = proposal_learner.query(N)
+    for M in range(1, N):
+        R_tilde[M-1]= BiasedEstimator(dataset_pool, mean_squared_error).evaluate_risk(true_linear_regressor,
+                                                                                      query_idx=np.arange(M))
+        R_pure[M-1] = RpureEstimator(dataset_pool,
+                                        mean_squared_error).evaluate_risk(true_linear_regressor, acq_probs,
+                                                                          query_idx=np.arange(M))
+        R_lure[M-1] = RlureEstimator(dataset_pool,
+                                        mean_squared_error).evaluate_risk(true_linear_regressor, acq_probs,
+                                                                          query_idx=np.arange(M))
+    return R_hat-R_tilde, R_hat-R_pure, R_hat-R_lure
+
+def average_simulate_budget(n_iter=500):
+    bias_tilde= np.zeros(shape=(dataset_pool.n_points-1, n_iter))
+    bias_pure= np.zeros(shape=(dataset_pool.n_points-1, n_iter))
+    bias_lure= np.zeros(shape=(dataset_pool.n_points-1, n_iter))
     for i in range(n_iter):
-        bias= simulate_bias(dataset, total_budget, al_learner, n_initial, plot=False)
-        average_bias["biased"]+=bias["biased"]
-        average_bias["pure"]+=bias["pure"]
-        average_bias["lure"]+=bias["lure"]
-    average_bias["biased"], average_bias["pure"], average_bias["lure"] =average_bias["biased"]/n_iter, average_bias["pure"]/n_iter, average_bias["lure"]/n_iter
+        print(i)
+        bias_tilde[:,i], bias_pure[:,i], bias_lure[:,i]= simulate_budget()
 
-    if plot==True:
-        sns.lineplot(x=total_budget, y=average_bias["biased"], label="Biased")
-        sns.lineplot(x=total_budget, y=average_bias["pure"], label="Rpure")
-        sns.lineplot(x=total_budget, y=average_bias["lure"], label="Rlure")
-        plt.title(f"Bias for all estimators with the {al_learner.__class__.__name__} over {n_iter} iterations")
-        plt.show()
+    mean_R_tilde, std_R_tilde = np.mean(bias_tilde, axis=1), np.std(bias_tilde, axis=1)
+    mean_R_pure, std_R_pure = np.mean(bias_pure, axis=1), np.std(bias_pure, axis=1)
+    mean_R_lure, std_R_lure = np.mean(bias_lure, axis=1), np.std(bias_lure, axis=1)
+    x= np.arange(1, dataset_pool.n_points)
+    plt.plot(x, mean_R_tilde, 'b--', label='R_tilde')
+    plt.fill_between(x, mean_R_tilde - std_R_tilde, mean_R_tilde + std_R_tilde, color='b', alpha=0.2)
+    plt.plot(x, mean_R_pure, 'r--', label='R_pure')
+    plt.fill_between(x, mean_R_pure - std_R_pure, mean_R_pure + std_R_pure, color='r', alpha=0.2)
+    plt.plot(x, mean_R_lure, 'g--', label='R_lure')
+    plt.fill_between(x, mean_R_lure - std_R_lure, mean_R_lure + std_R_lure, color='g', alpha=0.2)
+    plt.legend(title=f"Bias over {n_iter} iterations")
+    plt.ylim(ymin=-1.5, ymax=1.5)
+    plt.show()
 
-    return average_bias
 
-avg_bias_boltzman=simulate_bias_average(dataset_pool, total_budget, boltzman_learner, n_iter=500, n_initial=1, plot=True)
-avg_bias_proposal=simulate_bias_average(dataset_pool, total_budget, proposal_learner, n_iter=500, n_initial=1, plot=True)
 
-embed()
-
+figure1(15)
+figure2(15, 100)
+average_simulate_budget(10)
+average_simulate_budget(500)

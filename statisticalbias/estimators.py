@@ -28,8 +28,8 @@ class BiasedEstimator(RiskEstimator):
             query_idx=np.arange(len(self.dataset.queries))
         y_true= self.dataset.y[self.dataset.queries[query_idx]]
         y_pred= model.predict(self.dataset.queries[query_idx])
-        loss= [self.loss_fn(y_true[i], y_pred[i]) for i in range(0, len(y_true))]
-        assert(len(loss)==len(y_true))
+        loss= np.array([self.loss_fn(y_true[i], y_pred[i]) for i in range(0, len(y_true))]).reshape(-1,1)
+        assert (loss.shape == y_true.shape)
         return np.mean(loss)
 
 
@@ -37,34 +37,40 @@ class RpureEstimator(RiskEstimator):
     def __init__(self, dataset, loss_fn):
         super(RpureEstimator, self).__init__(dataset, loss_fn)
 
+    def get_weights(self, acq_probs):
+        M=len(acq_probs)
+        N= self.dataset.n_points
+        m= np.arange(1,M+1).reshape(-1,1)
+        acq_weights = (1 / (N * acq_probs) + (M - m) / N)
+        return acq_weights.squeeze()
+
     def evaluate_risk(self, model, acq_probs, query_idx=None):
         if query_idx is None:
             query_idx=np.arange(len(self.dataset.queries))
         y_true= self.dataset.y[self.dataset.queries[query_idx]]
         y_pred= model.predict(self.dataset.queries[query_idx])
-        loss= np.array([self.loss_fn(y_true[i], y_pred[i]) for i in range(0, len(y_true))]).reshape(-1,1)
-        assert(loss.shape==y_true.shape)
+        loss= np.array([self.loss_fn(y_true[i], y_pred[i]) for i in range(0, len(y_true))])
 
-        M= len(query_idx)
-        N= self.dataset.n_points
-        m= np.arange(1,M+1).reshape(-1,1)
-        acq_weights= (1/(N*acq_probs[query_idx])+(M-m)/N)
-        return acq_weights.squeeze(), np.mean(loss*acq_weights)
+        acq_weights= self.get_weights(acq_probs[query_idx])
+        return np.mean(loss*acq_weights)
 
 class RlureEstimator(RiskEstimator):
     def __init__(self, dataset, loss_fn):
         super(RlureEstimator, self).__init__(dataset, loss_fn)
+
+    def get_weights(self, acq_probs):
+        M=len(acq_probs)
+        N= self.dataset.n_points
+        m= np.arange(1,M+1).reshape(-1,1)
+        acq_weights = 1 + (1 / ((N - m + 1) * acq_probs) - 1) * (N - M) / (N - m)
+        return acq_weights.squeeze()
 
     def evaluate_risk(self, model, acq_probs, query_idx=None):
         if query_idx is None:
             query_idx=np.arange(len(self.dataset.queries))
         y_true= self.dataset.y[self.dataset.queries[query_idx]]
         y_pred=model.predict(self.dataset.queries[query_idx])
-        loss= np.array([self.loss_fn(y_true[i], y_pred[i]) for i in range(0,len(y_true))]).reshape(-1,1)
-        assert(loss.shape==y_true.shape)
+        loss= np.array([self.loss_fn(y_true[i], y_pred[i]) for i in range(0,len(y_true))])
 
-        M=len(query_idx)
-        N=self.dataset.n_points
-        m=np.arange(1,M+1).reshape(-1,1)
-        acq_weights= 1+(1/((N-m+1)*acq_probs[query_idx]) - 1)*(N-M)/(N-m)
-        return acq_weights.squeeze(), np.mean(loss*acq_weights)
+        acq_weights= self.get_weights(acq_probs[query_idx])
+        return np.mean(loss*acq_weights)
