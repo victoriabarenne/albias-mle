@@ -1,4 +1,5 @@
 import numpy as np
+from sklearn.metrics import mean_squared_error
 
 class RiskEstimator:
     def __init__(self, dataset, loss_fn):
@@ -9,32 +10,32 @@ class RiskEstimator:
         pass
 
 class TrueEstimator(RiskEstimator):
-    def __init__(self, dataset, loss_fn):
+    def __init__(self, dataset, loss_fn=mean_squared_error):
         super(TrueEstimator, self).__init__(dataset, loss_fn)
 
     def evaluate_risk(self, model):
         y_true= self.dataset.y
-        y_pred=model.predict(np.arange(0, self.dataset.n_points))
-        loss= [self.loss_fn(y_true[i], y_pred[i]) for i in range(0,len(y_true))]
+        y_pred=model.predict(self.dataset)
+        loss= np.array([self.loss_fn(y_true[i], y_pred[i]) for i in range(0,len(y_true))])
         assert(len(loss)==len(y_true))
         return np.mean(loss)
 
 class BiasedEstimator(RiskEstimator):
-    def __init__(self, dataset, loss_fn):
+    def __init__(self, dataset, loss_fn=mean_squared_error):
         super(BiasedEstimator, self).__init__(dataset, loss_fn)
 
     def evaluate_risk(self, model, query_idx=None):
         if query_idx is None:
             query_idx=np.arange(len(self.dataset.queries))
         y_true= self.dataset.y[self.dataset.queries[query_idx]]
-        y_pred= model.predict(self.dataset.queries[query_idx])
+        y_pred= model.predict(self.dataset, self.dataset.queries[query_idx])
         loss= np.array([self.loss_fn(y_true[i], y_pred[i]) for i in range(0, len(y_true))]).reshape(-1,1)
         assert (loss.shape == y_true.shape)
         return np.mean(loss)
 
 
 class RpureEstimator(RiskEstimator):
-    def __init__(self, dataset, loss_fn):
+    def __init__(self, dataset, loss_fn=mean_squared_error):
         super(RpureEstimator, self).__init__(dataset, loss_fn)
 
     def get_weights(self, acq_probs):
@@ -48,9 +49,8 @@ class RpureEstimator(RiskEstimator):
         if query_idx is None:
             query_idx=np.arange(len(self.dataset.queries))
         y_true= self.dataset.y[self.dataset.queries[query_idx]]
-        y_pred= model.predict(self.dataset.queries[query_idx])
+        y_pred= model.predict(self.dataset, self.dataset.queries[query_idx])
         loss= np.array([self.loss_fn(y_true[i], y_pred[i]) for i in range(0, len(y_true))])
-
         acq_weights= self.get_weights(acq_probs[query_idx])
         return np.mean(loss*acq_weights)
 
@@ -69,8 +69,7 @@ class RlureEstimator(RiskEstimator):
         if query_idx is None:
             query_idx=np.arange(len(self.dataset.queries))
         y_true= self.dataset.y[self.dataset.queries[query_idx]]
-        y_pred=model.predict(self.dataset.queries[query_idx])
+        y_pred=model.predict(self.dataset, self.dataset.queries[query_idx])
         loss= np.array([self.loss_fn(y_true[i], y_pred[i]) for i in range(0,len(y_true))])
-
         acq_weights= self.get_weights(acq_probs[query_idx])
         return np.mean(loss*acq_weights)
