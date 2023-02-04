@@ -45,6 +45,8 @@ class BoltzmanSampler(ActiveLearner):
         if np.sum(self.dataset.labeled)==0:
             initial_idx= np.random.choice(range(self.n_pool), n_initial)
             self.dataset.observe(initial_idx)
+        elif np.sum(self.dataset.labeled)>0:
+            n_initial=0
 
         #Selection of new queries
         for i in range(n_initial, M):
@@ -70,7 +72,6 @@ class ProposalDistributionSampler(ActiveLearner):
         super(ProposalDistributionSampler, self).__init__(dataset, model)
         self.proposal=proposal
         self.name="Proposal distribution Sampler"
-
 
     def query(self, M, n_initial=1):
 

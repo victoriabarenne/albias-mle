@@ -93,10 +93,11 @@ class SinusoidalData2D(ActiveLearningDataset):
         return X, y
 
 
-class ActiveUnbalancedMNIST(ActiveLearningDataset):
-    def __init__(self, noise_ratio=0.1, p_train=0.25, random_state= None):
-        mnist_unbalanced= torchvision.datasets.MNIST(root="",
-                                                     train=True,
+
+class ActiveMNIST(ActiveLearningDataset):
+    def __init__(self, noise_ratio=0.1, p_train=0.25, train=True, unbalanced=True, random_state= None):
+        mnist= torchvision.datasets.MNIST(root="",
+                                                     train=train,
                                                      transform= ToTensor(),
                                                      download=False)
 
@@ -106,27 +107,37 @@ class ActiveUnbalancedMNIST(ActiveLearningDataset):
             state_torch= torch.random.get_rng_state()
             torch.random.manual_seed(random_state)
 
-        idx = np.random.choice(np.arange(60000), int(noise_ratio*60000), replace=False)
-        random_labels = torch.randint(high=10, size=(len(idx),))
-        mnist_unbalanced.targets[idx] = random_labels
+        if noise_ratio>0:
+            idx = np.random.choice(np.arange(len(mnist)), int(noise_ratio*len(mnist)), replace=False)
+            random_labels = torch.randint(high=10, size=(len(idx),))
+            mnist.targets[idx] = random_labels
 
         # Select classes proportional to ratio
-        class_balance = [1, 0.5, 0.5, 0.2, 0.2, 0.2, 0.1, 0.1, 0.01, 0.01]
+        if unbalanced:
+            class_balance = [1, 0.5, 0.5, 0.2, 0.2, 0.2, 0.1, 0.1, 0.01, 0.01]
+        else:
+            class_balance= np.array([1, 1, 1, 1, 1, 1, 1, 1, 1, 1])
+
         idx = np.array([], dtype=int)
         for target in np.arange(10):
-            class_idx = np.where(mnist_unbalanced.targets == target)[0]
+            class_idx = np.where(mnist.targets == target)[0]
             idx_all = np.random.choice(class_idx, size=int(p_train * class_balance[target] * len(class_idx)),
                                          replace=False)
             idx = np.concatenate((idx, idx_all), axis=0)
 
-        idx_val = np.isin(idx, np.random.choice(idx, 1000, replace=False))
+        if train== True:
+            idx_val = np.isin(idx, np.random.choice(idx, 1000, replace=False))
+        else:
+            idx_val= np.repeat(False, repeats=idx.shape)
 
+        if train==True:
+            self.validation = WeightedSubset(mnist, np.where(idx_val == True)[0], unsqueeze=True)
 
-        self.validation = WeightedSubset(mnist_unbalanced, np.where(idx_val == True)[0], unsqueeze=True)
-        self.all = WeightedSubset(mnist_unbalanced, np.where(idx_val == False)[0], unsqueeze=True)
-        self.available = WeightedSubset(mnist_unbalanced, np.where(idx_val == False)[0], unsqueeze=True)
-        self.train = WeightedSubset(mnist_unbalanced, np.array([], dtype=int), torch.tensor([]), unsqueeze=True)
+        self.all = WeightedSubset(mnist, np.where(idx_val == False)[0], unsqueeze=True)
+        self.available = WeightedSubset(mnist, np.where(idx_val == False)[0], unsqueeze=True)
+        self.train = WeightedSubset(mnist, np.array([], dtype=int), torch.tensor([]), unsqueeze=True)
         self.n_points= len(self.all)
+
 
         # Reset the seed
         if random_state is not None:
@@ -138,10 +149,13 @@ class ActiveUnbalancedMNIST(ActiveLearningDataset):
         self.acq_prob = torch.tensor([])
 
 
-    def get_dataloaders(self, batch_size):
+    def get_trainloader(self, batch_size):
         train_loader = DataLoader(self.train, batch_size=batch_size, shuffle=True)
+        return train_loader
+
+    def get_availableloader(self, batch_size):
         available_loader = DataLoader(self.available, batch_size=batch_size, shuffle=True)
-        return train_loader, available_loader
+        return available_loader
 
     def observe(self, idx, prob, idx_absolute=True):
         self.labeled[idx] = 1
@@ -167,82 +181,3 @@ class ActiveUnbalancedMNIST(ActiveLearningDataset):
         print(len(self.train), len(self.available))
 
 
-
-# ################################################################################################################################################
-# class MNISTdataset(ActiveLearningDataset):
-#     def __init__(self, noise_ratio= 0.1, p_train=0.25, random_state=None):
-#         self.all = torchvision.datasets.MNIST(root="",
-#                                                  train=True,
-#                                                  transform=ToTensor(),
-#                                                  download=False)
-#         self.random_state= random_state
-#
-#         ## Creating Unbalanced MNIST
-#         # Noise to 10% of the training labels
-#         if self.random_state is not None:
-#             state = np.random.get_state()
-#             np.random.seed(self.random_state)
-#             state_torch= torch.random.get_rng_state()
-#             torch.random.manual_seed(self.random_state)
-#             state_torch_modified= torch.random.get_rng_state()
-#
-#         idx = np.random.choice(np.arange(60000), int(noise_ratio*60000), replace=False)
-#         random_labels = torch.randint(high=10, size=(len(idx),))
-#         self.all.targets[idx] = random_labels
-#
-#         # Select classes proportional to ratio
-#         class_balance = [1, 0.5, 0.5, 0.2, 0.2, 0.2, 0.1, 0.1, 0.01, 0.01]
-#         idx = np.array([], dtype=int)
-#         for target in np.arange(10):
-#             class_idx = np.where(self.all.targets == target)[0]
-#             idx_all = np.random.choice(class_idx, size=int(p_train * class_balance[target] * len(class_idx)),
-#                                          replace=False)
-#             idx = np.concatenate((idx, idx_all), axis=0)
-#
-#         idx_val = np.isin(idx, np.random.choice(idx, 1000, replace=False))
-#         self.val = Subset(self.all, np.where(idx_val == True)[0])
-#         self.all = Subset(self.all, np.where(idx_val == False)[0])
-#         self.n_points= len(self.all)
-#         self.available= Subset(self.all, np.arange(len(self.all)))
-#         self.train= Subset(self.all, np.array([]))
-#
-#         # Reset the seed
-#         if self.random_state is not None:
-#             np.random.set_state(state)
-#             torch.random.set_rng_state(state_torch)
-#
-#         self.labeled= np.zeros(len(self.all), dtype=int)
-#         self.queries = np.array([], dtype=int)
-#         self.acq_prob = np.array([])
-#
-#     def get_dataloaders(self, batch_size):
-#         train_loader= torch.utils.data.DataLoader(self.train, batch_size=batch_size, shuffle=True)
-#         available_loader= torch.utils.data.DataLoader(self.available, batch_size=batch_size, shuffle=True)
-#         return train_loader, available_loader
-#
-#     def observe(self, idx, prob, idx_absolute= True):
-#         self.labeled[idx]=1
-#         if isinstance(idx, int):
-#             idx= np.array([idx])
-#         elif idx.ndim==0:
-#             idx = np.array([idx])
-#
-#         if isinstance(prob, float):
-#             prob= np.array([prob])
-#         elif prob.ndim==0:
-#             prob = np.array([prob])
-#
-#         if idx_absolute==False:
-#             #idx is the idx in all available data: available[idx]= probs not all[idx]=probs
-#             idx= np.arange(len(self.all))[self.labeled==0][idx]
-#
-#         self.queries= np.concatenate((self.queries, idx), axis=0).astype(int)
-#         self.acq_prob= np.concatenate((self.acq_prob, prob), axis=0)
-#
-#         idx_train = np.isin(np.arange(len(self.all)), self.queries)
-#         self.train= Subset(self.all, np.where(idx_train==True)[0])
-#         self.available= Subset(self.all, np.where(idx_train==False)[0])
-#         print(len(self.train), len(self.available))
-#
-#
-#

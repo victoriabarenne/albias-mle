@@ -8,7 +8,7 @@ import seaborn as sns
 import torchvision
 import pandas as pd
 from torch.utils.data import Subset
-from datasets import ActiveUnbalancedMNIST
+from datasets import ActiveMNIST
 import copy
 
 import torch
@@ -114,33 +114,29 @@ class BNN_variational(Module):
         # Input has shape [examples, samples, n_channels, height, width]
         #Conv part
         out = F.relu(self.conv1(x))
-        # print("Conv1", out.shape)
         out = self.max_pool(out)
-        # print("Maxpool1", out.shape)
         out = F.relu(self.conv2(out))
-        # print("Conv2", out.shape)
         out = self.max_pool(out)
-        # print("Maxpool2", out.shape)
 
         # MLP part
         s = out.shape
         out = torch.reshape(out, (s[0], s[1], -1))
-        # print("linear input", out.shape)
         out = F.relu(self.fc1(out))
-        # print("linear1", out.shape)
         out = F.log_softmax(self.fc2(out), dim=-1)
-        # print("output", out.shape)
         return out
 
+#### Model Training, Evaluation and Testing
 
-
-def train(model, dataset, train_loader, device, variational_samples, loss, optimizer, bias_correction):
+def train(model, train_loader, device, variational_samples, loss, optimizer, bias_correction, N):
     '''
     Trains model for one epoch
+    N: len(dataset.all)
     '''
     model.train()
     model.to(device)
     epoch_loss= 0
+    m_id=0
+
     for batch_id, (data, target, acq_prob) in enumerate(train_loader):
         # zero the parameter gradients
         data, target = data.to(device), target.to(device)
@@ -157,16 +153,16 @@ def train(model, dataset, train_loader, device, variational_samples, loss, optim
             #TODO: regulazing term can be changed? (to other than 1/10)
             return nll_loss + kl_loss / 10
 
-        M= len(dataset.train)
-        N= dataset.n_points
-        # TODO: Or is N= len(dataset.available??)
+        M = len(train_loader.dataset)
+        m= torch.arange(m_id, m_id+len(acq_prob))+1
+        m_id= m_id+len(acq_prob)
         if bias_correction== "none":
             batch_loss = loss_helper(output, target).mean(0)
         elif bias_correction=="pure":
-            weight= 1/(N*acq_prob)+(M-torch.arange(1, M+1))/N
+            weight= 1/(N*acq_prob)+(M-m)/N
             batch_loss= (weight*loss_helper(output, target)).mean(0)
         elif bias_correction== "lure":
-            weight= 1 + (N-M)/(N-torch.arange(1, M+1))*(1/((N-torch.arange(1,M+1)+1)*acq_prob)-1)
+            weight= 1 + (N-M)/(N-torch.arange(1, M+1))*(1/((N-m+1)*acq_prob)-1)
             batch_loss= (weight*loss_helper(output, target)).mean(0)
 
         batch_loss.backward()
@@ -177,7 +173,7 @@ def train(model, dataset, train_loader, device, variational_samples, loss, optim
     return epoch_loss
 
 
-def train_all(model, dataset, train_loader, val_loader, device, learning_rate, variational_samples, batch_size, n_epochs, early_stopping, bias_correction):
+def train_all(model, train_loader, val_loader, device, learning_rate, variational_samples, batch_size, n_epochs, early_stopping, bias_correction, N):
     loss = Elbo(binary=False, regression=False)
     loss.set_model(model, batch_size)
     loss.set_num_batches(len(train_loader))
@@ -187,9 +183,12 @@ def train_all(model, dataset, train_loader, val_loader, device, learning_rate, v
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, amsgrad=True)
 
     for epoch in range(n_epochs):
-        epoch_loss= train(model, dataset, train_loader, device, variational_samples, loss, optimizer, bias_correction)
+        #TODO M,N, what are they?
+        # N = dataset.n_points
+        # TODO: Or is N= len(dataset.available??)
+        epoch_loss= train(model, train_loader, device, variational_samples, loss, optimizer, bias_correction, N)
         train_losses.append(epoch_loss)
-        val_loss = validate(model, val_loader, device, variational_samples, loss, bias_correction)
+        val_loss = evaluate(model, val_loader, device, variational_samples, loss, "none", len(val_loader.dataset))
         val_losses.append(val_loss)
         if epoch==0:
             best_loss= val_loss
@@ -205,19 +204,20 @@ def train_all(model, dataset, train_loader, val_loader, device, learning_rate, v
             break
         print(f'Epoch {epoch+1}: Training loss {epoch_loss:.6f}, Validation loss {val_loss:.6f}')
 
-    return train_losses, val_losses
+    return train_losses, val_losses, best_loss
 
-def validate(model, val_loader, device, variational_samples, loss, bias_correction):
+def evaluate(model, eval_loader, device, variational_samples, loss, bias_correction, N):
     model.eval()
     model.to(device)
-    val_loss= 0
-    for batch_id, (data, target, acq_prob) in enumerate(val_loader):
+    eval_loss= 0
+    M = len(eval_loader.dataset)
+    m_id=0
+    for batch_id, (data, target, acq_prob) in enumerate(eval_loader):
         # zero the parameter gradients
         data, target = data.to(device), target.to(device)
         # change input to variational
         data = data.unsqueeze(1)
         data = data.expand((-1, variational_samples, -1, -1, -1))
-
         output = model(data)
         output = output.squeeze()
 
@@ -226,27 +226,57 @@ def validate(model, val_loader, device, variational_samples, loss, bias_correcti
             #TODO: regulazing term can be changed? (to other than 1/10)
             return nll_loss + kl_loss / 10
 
-        M = len(dataset.train)
-        N = dataset.n_points
+        m= torch.arange(m_id, m_id+len(data))+1
+        m_id= m_id+len(data)
         if bias_correction== "none":
             batch_loss = loss_helper(output, target).mean(0)
         elif bias_correction=="pure":
-            weight= 1/(N*acq_prob)+(M-torch.arange(1, M+1))/N
+            weight= 1/(N*acq_prob)+(M-m)/N
             batch_loss= (weight*loss_helper(output, target)).mean(0)
         elif bias_correction== "lure":
-            weight= 1 + (N-M)/(N-torch.arange(1, M+1))*(1/((N-torch.arange(1,M+1)+1)*acq_prob)-1)
+            weight= 1 + (N-M)/(N-m)*(1/((N-m+1)*acq_prob)-1)
             batch_loss= (weight*loss_helper(output, target)).mean(0)
+        eval_loss += batch_loss.item()
+    return eval_loss/len(eval_loader)
 
-        val_loss += batch_loss.item()
-        return val_loss
+
+def testing(model, testing_loader, device, variational_samples, loss, N):
+    model.eval()
+    model.to(device)
+    test_loss_none, test_loss_pure, test_loss_lure= 0,0,0
+    M = len(testing_loader.dataset)
+    m_id=0
+    for batch_id, (data, target, acq_prob) in enumerate(testing_loader):
+        data, target = data.to(device), target.to(device)
+        data = data.unsqueeze(1)
+        data = data.expand((-1, variational_samples, -1, -1, -1))
+        output = model(data)
+        output = output.squeeze()
+
+        def loss_helper(prediction, target):
+            nll_loss, kl_loss = loss.compute_loss(prediction, target)
+            return nll_loss
+
+        m= torch.arange(m_id, m_id+len(data))+1
+        m_id= m_id+len(data)
+        batch_loss_none = loss_helper(output, target).mean(0)
+        weight_pure= 1/(N*acq_prob)+(M-m)/N
+        batch_loss_pure= (weight_pure*loss_helper(output, target)).mean(0)
+        weight_lure= 1 + (N-M)/(N-m)*(1/((N-m+1)*acq_prob)-1)
+        batch_loss_lure= (weight_lure*loss_helper(output, target)).mean(0)
+        print(batch_loss_none, batch_loss_pure, batch_loss_pure)
+        test_loss_none += batch_loss_none.item()
+        test_loss_pure += batch_loss_pure.item()
+        test_loss_lure += batch_loss_lure.item()
+    return test_loss_none/len(testing_loader), test_loss_pure/len(testing_loader), test_loss_lure/len(testing_loader)
 
 
 def compute_score(model, dataset, batch_size, device, acquisition_var_samples):
     """
     Returns score for each available point in dataset,
-    mutual information between the output and the disrtribution theta (of the model)
+    mutual information between the output and the distribution theta (of the model)
     """
-    _, available_loader= dataset.get_dataloaders(batch_size)
+    available_loader= dataset.get_availableloader(batch_size)
     model.eval()
     model.to(device)
     scores= np.array([])
@@ -270,7 +300,6 @@ def compute_score(model, dataset, batch_size, device, acquisition_var_samples):
     return scores
 
 batch_size=64
-dataset= ActiveUnbalancedMNIST(noise_ratio= 0.1, p_train=0.25, random_state=2) # unbalanced MNIST
 loss_fn= nn.NLLLoss()
 n_epochs=100
 early_stopping_epochs= 20
@@ -278,13 +307,20 @@ device= "cpu" # or "cpu"
 log_interval=100
 learning_rate=5*10e-4
 variational_samples=8
-bias_correction="none"
+variational_samples_test=8
 acquisition_var_samples=100
 T= 10000
 points_per_acquisition= 1
 initial_pool=10
 goal_points=70
 training_frequency=1
+
+#0) Initialize model and training/testing datasets
+dataset= ActiveMNIST(noise_ratio= 0.1, p_train=0.25, train=True, unbalanced= True, random_state=2) # unbalanced MNIST
+dataset_testing= ActiveMNIST(noise_ratio=0, p_train=0.1, train=False, unbalanced= False, random_state=1)
+val_loader = torch.utils.data.DataLoader(dataset.validation, batch_size=batch_size, shuffle=True)
+N= dataset.n_points
+N_test= dataset_testing.n_points
 
 # 1) Initialize using 10 random samples from the training data pool
 initial_idx= np.random.randint(low=0, high= len(dataset.available), size=initial_pool)
@@ -293,20 +329,17 @@ dataset.observe(initial_idx, prob)
 n_acquired=0
 
 while ((len(dataset.queries)<goal_points)):
-    # 2) Train model using Dtrain and R_tilde loss (unmodified loss)
+    # 2) Train model using Dtrain and R_tilde loss
     #TODO: do we reinitialize the model in between each aquisition of points??
     model = BNN_variational()
-    val_loader = torch.utils.data.DataLoader(dataset.validation, batch_size=batch_size, shuffle=True)
-    train_loader, _ = dataset.get_dataloaders(64)
-    train_all(model, dataset, train_loader, val_loader, device, learning_rate, variational_samples, batch_size,
-              n_epochs, early_stopping_epochs, bias_correction)
+    train_loader= dataset.get_trainloader(64)
+    train_all(model, train_loader, val_loader, device, learning_rate, variational_samples, batch_size,
+              n_epochs, early_stopping_epochs, "none", N)
 
     # 3) Select the next acquisition point
     print("Computing the scores for all available points")
     scores= compute_score(model, dataset, batch_size, device, acquisition_var_samples)
     q_proposal= torch.nn.Softmax(dim=0)(T*torch.from_numpy(scores))
-    print(torch.any(torch.isnan(q_proposal)))
-    print(q_proposal.max(), q_proposal.min())
     id= np.random.choice(np.arange(len(scores)), size= points_per_acquisition, replace=True, p = q_proposal.detach().numpy())
     prob= q_proposal[id].item()
     dataset.observe(id, prob, idx_absolute=False)
@@ -316,10 +349,29 @@ while ((len(dataset.queries)<goal_points)):
     # 4) Train models using only the training data using no bias-correction, pure, and lure correction every 3 aquisition rounds
     if n_acquired==training_frequency:
         model_none, model_pure, model_lure= BNN_variational(), BNN_variational(), BNN_variational()
-        train_loader, _ = dataset.get_dataloaders(64)
-        train_all(model_none, dataset, train_loader, val_loader, device, learning_rate, variational_samples, batch_size, n_epochs, early_stopping_epochs, bias_correction="none")
-        train_all(model_pure, dataset, train_loader, val_loader, device, learning_rate, variational_samples, batch_size, n_epochs, early_stopping_epochs, bias_correction="pure")
-        train_all(model_lure, dataset, train_loader, val_loader, device, learning_rate, variational_samples, batch_size, n_epochs, early_stopping_epochs, bias_correction="lure")
+        train_loader = dataset.get_trainloader(64)
+        train_loss_none, eval_loss_none, _= train_all(model_none, train_loader, val_loader, device, learning_rate, variational_samples, batch_size, n_epochs, early_stopping_epochs, "none", N)
+        train_loss_pure, eval_loss_pure, _= train_all(model_pure, train_loader, val_loader, device, learning_rate, variational_samples, batch_size, n_epochs, early_stopping_epochs, "pure", N)
+        train_loss_lure, eval_loss_lure, _= train_all(model_lure, train_loader, val_loader, device, learning_rate, variational_samples, batch_size, n_epochs, early_stopping_epochs, "lure", N)
         n_acquired = 0
 
+        embed()
+
+        # 5) Evaluate the models using the test set (to get the bias)
+        print("Computing the scores for all available points")
+        scores = compute_score(model, dataset_testing, batch_size, device, acquisition_var_samples)
+        q_proposal = torch.nn.Softmax(dim=0)(T * torch.from_numpy(scores))
+        # Note: Important that M<N, otherwise we get a zero in the denominator of the lure weights
+        idx = np.random.choice(np.arange(len(scores)), size=len(scores)-1, replace=False,
+                               p=q_proposal.detach().numpy())  # This will pick out every single index, but in approx decreasing probability
+        prob = q_proposal[idx].numpy()
+        dataset_testing.observe(idx, prob)
+
+        testing_loader = dataset_testing.get_trainloader(batch_size)
+        loss = Elbo(binary=False, regression=False)
+        loss.set_model(model_none, batch_size)
+        loss.set_num_batches(len(testing_loader))
+        testing_loss=[]
+        for model in [model_none, model_pure, model_lure]:
+            testing_loss.append(testing(model, testing_loader, device, variational_samples_test, loss, N_test))
 

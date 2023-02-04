@@ -1,6 +1,6 @@
 import numpy as np
 from sklearn import datasets
-from snelson import snelson1d
+from datasets import snelson1d
 from IPython import embed
 import seaborn as sns
 import matplotlib.pyplot as plt
