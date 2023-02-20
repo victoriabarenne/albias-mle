@@ -5,7 +5,7 @@ import seaborn as sns
 import random
 import torchvision
 from torch.utils.data import DataLoader, Dataset, Subset
-from torchvision.transforms import ToTensor, Normalize
+from torchvision.transforms import ToTensor, Normalize, Compose
 import torch
 
 class Dataset:
@@ -21,6 +21,8 @@ class WeightedSubset(Dataset):
     def __init__(self, dataset, idx, weights=None, unsqueeze=False, transform= None):
         if weights is not None:
             assert(len(idx)==len(weights))
+        elif weights is None:
+            weights= torch.ones(size=(len(idx),1)).squeeze()
         self.data = dataset.data[idx]
         if unsqueeze:
             self.data = self.data.float().unsqueeze(1)
@@ -96,9 +98,9 @@ class SinusoidalData2D(ActiveLearningDataset):
 
 class ActiveMNIST(ActiveLearningDataset):
     def __init__(self, noise_ratio=0.1, p_train=0.25, train=True, unbalanced=True, random_state= None):
-        mnist= torchvision.datasets.MNIST(root="",
+        self.mnist= torchvision.datasets.MNIST(root="",
                                                      train=train,
-                                                     transform= ToTensor(),
+                                                     transform= Compose([ToTensor(), Normalize((0.1307,), (0.3081,))]),
                                                      download=False)
 
         if random_state is not None:
@@ -108,36 +110,40 @@ class ActiveMNIST(ActiveLearningDataset):
             torch.random.manual_seed(random_state)
 
         if noise_ratio>0:
-            idx = np.random.choice(np.arange(len(mnist)), int(noise_ratio*len(mnist)), replace=False)
+            idx = np.random.choice(np.arange(len(self.mnist)), int(noise_ratio*len(self.mnist)), replace=False)
             random_labels = torch.randint(high=10, size=(len(idx),))
-            mnist.targets[idx] = random_labels
+            self.mnist.targets[idx] = random_labels
 
         # Select classes proportional to ratio
         if unbalanced:
             class_balance = [1, 0.5, 0.5, 0.2, 0.2, 0.2, 0.1, 0.1, 0.01, 0.01]
         else:
             class_balance= np.array([1, 1, 1, 1, 1, 1, 1, 1, 1, 1])
-
-        idx = np.array([], dtype=int)
+        ratio= sum(class_balance)/10
+        idx_available = np.array([], dtype=int)
+        idx_val= np.array([], dtype=int)
         for target in np.arange(10):
-            class_idx = np.where(mnist.targets == target)[0]
-            idx_all = np.random.choice(class_idx, size=int(p_train * class_balance[target] * len(class_idx)),
-                                         replace=False)
-            idx = np.concatenate((idx, idx_all), axis=0)
+            class_idx = np.where(self.mnist.targets == target)[0]
+            if train:
+                idx_all = np.random.choice(class_idx, size=int(p_train * class_balance[target] * len(class_idx) + 100* class_balance[target]/ratio),
+                                             replace=False)
+                idx_available = np.concatenate((idx_available, idx_all[int(100*class_balance[target]/ratio):]), axis=0)
+                idx_val= np.concatenate((idx_val, idx_all[:int(100*class_balance[target]/ratio)]), axis=0)
+            else:
+                idx_all = np.random.choice(class_idx, size=int(p_train * class_balance[target] * len(class_idx)),
+                                           replace=False)
+                idx_available = np.concatenate((idx_available, idx_all[100:]), axis=0)
+        self.idx_available= idx_available
 
         if train== True:
-            idx_val = np.isin(idx, np.random.choice(idx, 1000, replace=False))
-        else:
-            idx_val= np.repeat(False, repeats=idx.shape)
+            self.idx_val = idx_val
+            self.validation = WeightedSubset(self.mnist, self.idx_val, unsqueeze=True)
 
-        if train==True:
-            self.validation = WeightedSubset(mnist, np.where(idx_val == True)[0], unsqueeze=True)
 
-        self.all = WeightedSubset(mnist, np.where(idx_val == False)[0], unsqueeze=True)
-        self.available = WeightedSubset(mnist, np.where(idx_val == False)[0], unsqueeze=True)
-        self.train = WeightedSubset(mnist, np.array([], dtype=int), torch.tensor([]), unsqueeze=True)
+        self.all = WeightedSubset(self.mnist, idx_available, unsqueeze=True)
+        self.available = WeightedSubset(self.mnist, idx_available, unsqueeze=True)
+        self.train = WeightedSubset(self.mnist, np.array([], dtype=int), unsqueeze=True)
         self.n_points= len(self.all)
-
 
         # Reset the seed
         if random_state is not None:
@@ -178,6 +184,17 @@ class ActiveMNIST(ActiveLearningDataset):
 
         self.train = WeightedSubset(self.all, self.queries, torch.from_numpy(self.acq_prob))
         self.available = WeightedSubset(self.all, np.where(self.labeled == 0)[0])
-        print(len(self.train), len(self.available))
+        print(f"Acquired point {idx} with probability {prob}. Train dataset: {len(self.train)} points")
+
+    def restart(self):
+        self.labeled= np.zeros(len(self.all), dtype=int)
+        self.queries = np.array([], dtype=int)
+        self.acq_prob = torch.tensor([])
+        self.available = WeightedSubset(self.mnist, self.idx_available, unsqueeze=True)
+        self.train = WeightedSubset(self.mnist, np.array([], dtype=int), unsqueeze=True)
+
+
+
+
 
 

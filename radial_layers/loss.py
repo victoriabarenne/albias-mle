@@ -120,3 +120,4 @@ class Elbo():
         kl_divergence_estimated_over_batch = (cross_entropy_sum - entropy_sum) / self.num_batches
 
         return nll_tensor / self.batch_size, kl_divergence_estimated_over_batch / self.batch_size
+

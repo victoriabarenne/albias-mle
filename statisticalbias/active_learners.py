@@ -50,7 +50,7 @@ class BoltzmanSampler(ActiveLearner):
 
         #Selection of new queries
         for i in range(n_initial, M):
-            self.model.train(self.dataset.queries)
+            self.model.train_epoch(self.dataset.queries)
             y_al = self.dataset.y[self.dataset.queries].reshape(1,-1)
             x_al = self.dataset.x[self.dataset.queries].reshape(1, -1)
             y_train_pred= self.model.predict(np.arange(0, self.n_pool)).reshape(-1,1)
