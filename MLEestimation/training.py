@@ -4,8 +4,10 @@ from laplace import Laplace
 import numpy as np
 from torch.nn.utils import parameters_to_vector
 from laplace.curvature.backpack import BackPackGGN
+from laplace.curvature.asdl import AsdlGGN
 from copy import deepcopy
 import wandb
+from IPython import embed
 def train_epoch_model(model, train_loader, optimizer, loss_fn, device, hyperparameters, likelihood):
     '''
     Trains model for one epoch
@@ -17,22 +19,22 @@ def train_epoch_model(model, train_loader, optimizer, loss_fn, device, hyperpara
     epoch_metric= 0
     N= len(train_loader.dataset)
 
-    for batch_id, (input, target) in enumerate(train_loader):
-        input, target = input.to(device), target.to(device)
+    for batch_id, (data, target) in enumerate(train_loader):
+        data, target = data.to(device), target.to(device)
         optimizer.zero_grad()
-        output = model(input)
+        output = model(data)
         # output = output.squeeze()
 
-        prior_precision = hyperparameters[0].exp()
+        prior_precision = hyperparameters[0].exp().to(device)
         if likelihood=="regression":
-            sigma_noise = hyperparameters[1].exp()
+            sigma_noise = hyperparameters[1].exp().to(device)
             crit= sigma_noise**2/N
         elif likelihood== "classification":
-            temperature= hyperparameters[1]
+            temperature= hyperparameters[1].to(device)
             crit= 1/N
             output= output/temperature
 
-        theta= parameters_to_vector(model.parameters())
+        theta= parameters_to_vector(model.parameters()).to(device)
         batch_loss= loss_fn(output,target) + prior_precision*(theta@theta)*crit
 
         if likelihood=="regression":
@@ -48,12 +50,13 @@ def train_epoch_model(model, train_loader, optimizer, loss_fn, device, hyperpara
     return epoch_loss/len(train_loader), epoch_metric/N
 
 
-def train_model(model, train_loader, val_loader, n_epochs, early_stopping, likelihood: str, learning_rate, device, hyperparameters):
-    path_to_project= "/Users/victoriabarenne/ALbias"
+def train_model(model, train_loader, val_loader, n_epochs, early_stopping, likelihood: str, learning_rate, device, hyperparameters, path_to_project):
     if likelihood=="regression":
         loss_fn= nn.MSELoss(reduction="mean")
     elif likelihood=="classification":
-        loss_fn= nn.CrossEntropyLoss(reduction="mean")
+        # loss_fn= nn.CrossEntropyLoss(reduction="mean")
+        loss_fn= nn.NLLLoss(reduction="mean")
+
     best_loss= np.inf
     patience=0
     best_model= model
@@ -87,7 +90,8 @@ def evaluate(model, val_loader, device, likelihood):
     if likelihood=="regression":
         loss_fn= nn.MSELoss(reduction="mean")
     elif likelihood=="classification":
-        loss_fn= nn.CrossEntropyLoss(reduction="mean")
+        # loss_fn= nn.CrossEntropyLoss(reduction="mean")
+        loss_fn= nn.NLLLoss(reduction="mean")
 
     for batch_id, (data, target) in enumerate(val_loader):
         # zero the parameter gradients
@@ -103,13 +107,14 @@ def evaluate(model, val_loader, device, likelihood):
     return loss / len(val_loader), metric / len(val_loader.dataset)
 
 
-def mle_training(model, train_loader, test_loader, likelihood, n_epochs, lr_param, lr_hyper, F=1, B=0, K=1, hessian_structure="kron", device= "cpu", prior_init=1., sigma_init=1., temperature_init=1.):
-    path_to_project= "/Users/victoriabarenne/ALbias"
+def mle_training(model, train_loader, test_loader, likelihood, n_epochs, lr_param, lr_hyper, model_arch, variational_samples, backend, F=1, B=0, K=1, hessian_structure="kron", device= "cpu", prior_init=1., sigma_init=1., temperature_init=1., path_to_project="/Users/victoriabarenne/ALbias/", track=False):
     # 0) Initialize model, its training optimizer and loss
     if likelihood=="regression":
         loss_fn= nn.MSELoss(reduction="mean")
     elif likelihood=="classification":
-        loss_fn= nn.CrossEntropyLoss(reduction="mean")
+        # loss_fn= nn.CrossEntropyLoss(reduction="mean")
+        loss_fn= nn.NLLLoss(reduction="mean")
+
     optimizer = torch.optim.Adam(model.parameters(), lr=lr_param, amsgrad=True)
 
     # 1) Initialize hyperparameters that appear in the marginal likelihood:
@@ -132,41 +137,45 @@ def mle_training(model, train_loader, test_loader, likelihood, n_epochs, lr_para
     best_model=model
 
     # scheduler= torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, 1000)
-    for epoch in range(1,n_epochs+1):
+    for epoch in range(1, n_epochs+1):
         epoch_training_loss, epoch_training_metric= train_epoch_model(model, train_loader, optimizer, loss_fn, device, hyperparameters, likelihood)
         epoch_testing_loss, epoch_testing_metric= evaluate(model, test_loader, device, likelihood)
-        wandb.log(data= {f"test_loss":epoch_testing_loss}, step=epoch)
-        wandb.log(data= {f"test_metric":epoch_testing_metric}, step=epoch)
+        if track:
+            wandb.log(data= {f"test_loss":epoch_testing_loss}, step=epoch)
+            wandb.log(data= {f"test_metric":epoch_testing_metric}, step=epoch)
+            wandb.log(data={f"train_loss": epoch_training_loss}, step=epoch)
+            wandb.log(data={f"train_metric": epoch_training_metric}, step=epoch)
 
         # scheduler.step()
         if (epoch>B)&(epoch%F==0):
             la = Laplace(model, likelihood,
                          hessian_structure= hessian_structure,
-                         sigma_noise=log_sigma.exp(),
-                         prior_precision=log_prior.exp(),
-                         temperature= temperature,
+                         sigma_noise=log_sigma.exp().to(device),
+                         prior_precision=log_prior.exp().to(device),
+                         temperature= temperature.to(device),
                          subset_of_weights='all',
-                         backend= BackPackGGN)
+                         backend= backend)
             la.fit(train_loader)
             for k in range(K):
                 hyper_optimizer.zero_grad()
-                noise= log_sigma.exp() if likelihood=="regression" else None
-                neg_marglik = -la.log_marginal_likelihood(log_prior.exp(), noise)
+                noise= log_sigma.exp().to(device) if likelihood=="regression" else None
+                neg_marglik = -la.log_marginal_likelihood(log_prior.exp().to(device), noise)
                 neg_marglik.backward(retain_graph=True)
                 hyper_optimizer.step()
-            noise = log_sigma.exp() if likelihood == "regression" else None
-            neg_marglik= -la.log_marginal_likelihood(log_prior.exp(), noise)
-            wandb.log(data={f"neg_margliks": neg_marglik.item()}, step=epoch)
-            wandb.log(data={f"priors": log_prior.exp().item()}, step=epoch)
-            if likelihood=="regression":
-                wandb.log(data={f"sigmas": log_sigma.exp().item()}, step=epoch)
+            noise = log_sigma.exp().to(device) if likelihood == "regression" else None
+            neg_marglik= -la.log_marginal_likelihood(log_prior.exp().to(device), noise)
+            if track:
+                wandb.log(data={f"neg_margliks_training": neg_marglik.item()}, step=epoch)
+                wandb.log(data={f"priors": log_prior.exp().item()}, step=epoch)
+                if likelihood=="regression":
+                    wandb.log(data={f"sigmas": log_sigma.exp().item()}, step=epoch)
 
             if neg_marglik< best_marglik:
                 torch.save(model.state_dict(), path_to_project + "/best_model.pth")
                 best_marglik= deepcopy(neg_marglik.item())
-                best_prior= deepcopy(la.prior_precision.detach().numpy())
+                best_prior= deepcopy(la.prior_precision.cpu().detach().numpy())
                 if likelihood=="regression":
-                    best_sigma= deepcopy(la.sigma_noise.detach().numpy())
+                    best_sigma= deepcopy(la.sigma_noise.cpu().detach().numpy())
             print(f"Epoch {epoch}: Training Loss {epoch_training_loss} Log MargLikelihood: {neg_marglik}")
         else:
             print(f"Epoch {epoch}: Training Loss {epoch_training_loss:.6f} Log MargLikelihood: not updated")
@@ -175,3 +184,4 @@ def mle_training(model, train_loader, test_loader, likelihood, n_epochs, lr_para
 
     best_hyperparameters= [best_prior] if likelihood=="classification" else [best_prior, best_sigma]
     return la, best_model, best_hyperparameters
+

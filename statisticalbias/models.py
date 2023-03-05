@@ -1,24 +1,17 @@
 import matplotlib.pyplot as plt
 import numpy as np
-from sklearn.metrics import mean_squared_error
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_squared_error
-from IPython import embed
 import seaborn as sns
-import torchvision
-import pandas as pd
-from torch.utils.data import Subset
-from datasets import ActiveMNIST
-import copy
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import Module
-from torchvision.transforms import ToTensor
+from IPython import embed
 
-from radial_layers.variational_bayes import SVI_Linear, SVIConv2D, SVIMaxPool2D
-from radial_layers.loss import Elbo
+from statisticalbias.radial_layers.variational_bayes import SVI_Linear, SVIConv2D, SVIMaxPool2D
+
 
 class Model(Module):
     def __init__(self, loss_fn=mean_squared_error, hyperparameters=None):
@@ -48,81 +41,6 @@ class LinearRegressor(Model):
         if show==True:
             plt.show()
 
-class BNN_variational(Module):
-    """
-    Classification convolutional network in "Statistical bias in active learning paper"
-    takes as input batch_size x n_training_var x n_channels x H x W
-    and outputs batch_size x n_training_var x n_classes
-    """
-    def __init__(self):
-        super(BNN_variational, self).__init__()
-        initial_rho = -4
-        initial_mu_std = ("he")
-        variational_distribution = "radial"
-        prior = {
-            "name": "gaussian_prior",
-            "sigma": 0.25,
-            "mu": 0,
-        }
-
-        self.conv1= SVIConv2D(
-            in_channels=1,
-            out_channels=16,
-            kernel_size=[5,5],
-            variational_distribution=variational_distribution,
-            prior= prior,
-            initial_rho= initial_rho,
-            mu_std= initial_mu_std
-        )
-
-        self.conv2 = SVIConv2D(
-            in_channels=16,
-            out_channels=32,
-            kernel_size=[5,5],
-            variational_distribution=variational_distribution,
-            prior= prior,
-            initial_rho=  initial_rho,
-            mu_std= initial_mu_std
-        )
-
-        self.max_pool= SVIMaxPool2D(
-            kernel_size= (2,2)
-        )
-
-
-        self.fc1= SVI_Linear(
-            in_features= 512,
-            out_features=128,
-            initial_rho= initial_rho,
-            initial_mu= initial_mu_std,
-            variational_distribution= variational_distribution,
-            prior= prior
-        )
-
-        self.fc2= SVI_Linear(
-            in_features= 128,
-            out_features=10,
-            initial_rho= initial_rho,
-            initial_mu= initial_mu_std,
-            variational_distribution= variational_distribution,
-            prior= prior
-        )
-
-    def forward(self, x):
-        # Input has shape [examples, samples, n_channels, height, width]
-        #Conv part
-        out = F.relu(self.conv1(x))
-        out = self.max_pool(out)
-        out = F.relu(self.conv2(out))
-        out = self.max_pool(out)
-
-        # MLP part
-        s = out.shape
-        out = torch.reshape(out, (s[0], s[1], -1))
-        out = F.relu(self.fc1(out))
-        out = F.log_softmax(self.fc2(out), dim=-1)
-        return out
-
 class RadialBNN(nn.Module):
     def __init__(self, channels):
         super(RadialBNN, self).__init__()
@@ -144,5 +62,25 @@ class RadialBNN(nn.Module):
         x = x.view(-1, variational_samples, self.fc_in_dim)
         x = F.relu(self.fc1(x))
         x = self.fc2(x)
-        return F.log_softmax(x, dim=2)
+        output= F.log_softmax(x, dim=2)
+        return output.squeeze()
 
+
+class MLP_dropout(nn.Module):
+    def __init__(self, n_layers, p, n_in, n_out, n_neurons=50):
+        super().__init__()
+        self.p = p
+        self.n_layers= n_layers
+        self.n_in= n_in
+        self.n_out= n_out
+        self.in_layer = nn.Linear(n_in, n_neurons)
+        self.hidden_layer= nn.Linear(n_neurons, n_neurons)
+        self.out_layer = nn.Linear(n_neurons, n_out)
+
+    def forward(self, x):
+        x = x.view(x.shape[0], -1)
+        x = F.relu(F.dropout(self.in_layer(x), p=self.p, training=True))
+        for _ in range(self.n_layers-1):
+            x = F.relu(F.dropout(self.hidden_layer(x), p=self.p, training=True))
+        x = self.out_layer(x)
+        return F.log_softmax(x, dim=1)

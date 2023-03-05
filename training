@@ -1,0 +1,314 @@
+from torch.nn.utils import parameters_to_vector
+from laplace.curvature.backpack import BackPackGGN
+from laplace.curvature.asdl import AsdlGGN
+import torch
+from statisticalbias.radial_layers.loss import Elbo
+from laplace import Laplace
+
+import numpy as np
+import math
+from copy import deepcopy
+
+from IPython import embed
+
+
+def train_epoch(model, dataset, train_loader, optimizer, bias_correction, model_arch: str, hyperparameters, likelihood="classification", variational_samples=8, device="cpu"):
+    '''
+    Trains model for one epoch
+    N: len(dataset.all)
+    '''
+    model.train()
+    model.to(device)
+    epoch_loss= 0
+    epoch_metric= 0
+    N= dataset.n_points
+    M= len(train_loader.dataset)
+    m= torch.arange(1, M+1).to(device)
+
+    if model_arch=="radial_bnn":
+        loss = Elbo(binary=False, regression=False)
+        loss.set_model(model, train_loader.batch_size)
+        loss.set_num_batches(len(train_loader))
+
+        def loss_helper(prediction, target):
+            nll_loss, kl_loss = loss.compute_loss(prediction, target)
+            # TODO: regulazing term can be changed? (to other than 1/10)
+            return nll_loss + kl_loss / 10
+    else:
+        if likelihood=="regression":
+            loss_helper= torch.nn.MSELoss(reduction="none")
+        elif likelihood=="classification":
+            # loss_helper= torch.nn.NLLLoss(reduction="none")
+            loss_helper= torch.nn.CrossEntropyLoss(reduction="none")
+
+    for batch_id, (data, target, acq_prob) in enumerate(train_loader):
+        optimizer.zero_grad()
+        # zero the parameter gradients
+        data, target, acq_prob = data.to(device), target.to(device), acq_prob.to(device)
+        output = model(data)  # shape batch_size x var_samples x n_output for radial_bnn, #batch_size x n_output otherwise
+        raw_loss = loss_helper(output, target).squeeze()
+
+        prior_precision = hyperparameters[0].exp().to(device)
+        if likelihood=="regression":
+            sigma_noise = hyperparameters[1].exp().to(device)
+            crit= sigma_noise**2/M
+        elif likelihood== "classification":
+            crit= 1/M
+
+        theta= parameters_to_vector(model.parameters()).to(device)
+
+        m_iter= m[batch_id*train_loader.batch_size: batch_id*train_loader.batch_size + len(acq_prob)]
+        if bias_correction== "none":
+            weight= 1
+        elif bias_correction=="pure":
+            weight= 1/(N*acq_prob)+(M-m_iter)/N
+        elif bias_correction== "lure":
+            weight= 1 + (N-M)/(N-m_iter)*(1/((N-m_iter+1)*acq_prob)-1)
+
+        likelihood_loss= (weight*raw_loss).mean(0)
+        batch_loss= likelihood_loss + prior_precision*(theta@theta)*crit
+
+        if likelihood=="classification":
+            if model_arch=="radial_bnn":
+                epoch_metric+= torch.sum(torch.argmax(output.mean(dim=1), dim= 1)==target).item()
+            else:
+                epoch_metric += torch.sum(torch.argmax(output, dim=1) == target).item()
+        elif likelihood=="regression":
+            epoch_metric+= raw_loss.sum().item()
+
+        batch_loss.backward()
+        optimizer.step()
+
+        # print statistics
+        epoch_loss += batch_loss.item()
+    # return epoch_loss/ len(train_loader)
+    return epoch_loss, epoch_metric/len(train_loader.dataset)
+
+
+
+def evaluate(model, eval_loader, bias_correction, model_arch, likelihood="classification", variational_samples=8, device="cpu"):
+    # model.train()
+    model.eval()
+    model.to(device)
+
+    val_loss= 0
+    val_weighted_loss= 0
+    metric=0
+
+    N= len(eval_loader.dataset)
+    M = len(eval_loader.dataset)
+    m= torch.arange(1, M+1).to(device)
+
+    if likelihood=="regression":
+        loss_helper= torch.nn.MSELoss(reduction="none")
+    elif likelihood=="classification":
+        loss_helper= torch.nn.CrossEntropyLoss(reduction="none")
+        # loss_helper= torch.nn.NLLLoss(reduction="none")
+
+    for batch_id, (data, target, acq_prob) in enumerate(eval_loader):
+        data, target, acq_prob = data.to(device), target.to(device), acq_prob.to(device)
+        if model_arch=="radial_bnn":
+            output = model(data)
+            output = output.squeeze()
+            prediction = torch.logsumexp(output, dim=1) - math.log(variational_samples)
+        elif (model_arch=="mlp") or (model_arch=="cnn"):
+            output = torch.stack([model(data) for _ in range(variational_samples)])
+            prediction = torch.logsumexp(output, dim=0) - math.log(variational_samples)
+
+        raw_loss= loss_helper(prediction, target).squeeze()
+
+        m_iter= m[batch_id*eval_loader.batch_size: batch_id*eval_loader.batch_size + len(acq_prob)]
+        if bias_correction== "none":
+            weight=1
+        elif bias_correction=="pure":
+            weight= 1/(N*acq_prob)+(M-m_iter)/N
+        elif bias_correction== "lure":
+            weight= 1 + (N-M)/(N-m_iter)*(1/((N-m_iter+1)*acq_prob)-1)
+            weight= torch.nan_to_num(weight, nan=1)
+
+
+        val_loss+=raw_loss.sum().item()
+        val_weighted_loss += (weight*raw_loss).sum().item()
+
+        if torch.any(torch.isnan(torch.tensor([val_loss]))):
+            print(weight)
+            print(torch.isnan(torch.tensor([val_loss])).sum())
+
+        if likelihood=="regression":
+            metric+= torch.sum((output-target)**2).item()
+        elif likelihood=="classification":
+            metric+= torch.sum(torch.argmax(prediction.detach(), dim=-1)==target).item()
+
+    # return eval_loss/len(eval_loader)
+    return val_loss/len(eval_loader.dataset), val_weighted_loss/len(eval_loader.dataset), metric/len(eval_loader.dataset)
+
+
+def train_all(model, dataset, train_loader, val_loader, n_epochs, learning_rate, bias_correction, model_arch, early_stopping, hyperparameters, likelihood, variational_samples, device="cpu"):
+    path_to_project= "/Users/victoriabarenne/ALbias"
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, amsgrad=True)
+    best_loss= np.inf
+    patience=0
+    best_model=model
+
+    for epoch in range(n_epochs):
+        train_loss, train_acc= train_epoch(model, dataset, train_loader, optimizer, bias_correction, model_arch, hyperparameters, likelihood, variational_samples, device)
+        # val_loss, _, val_metric = evaluate(model, val_loader, "none", model_arch, likelihood, variational_samples, device)
+        #
+        # if val_loss>best_loss:
+        #     patience+=1
+        # elif val_loss<=best_loss:
+        #     best_loss= deepcopy(val_loss)
+        #     torch.save(model.state_dict(), path_to_project+ "/best_model.pth")
+        #     patience = 0
+        # if patience>=early_stopping:
+        #     print(f"Early stopping at {epoch} epochs")
+        #     break
+        print(f"Epoch {epoch+1:0>3d} eval: Train nll: {train_loss:.4f}, Train Accuracy: {train_acc}")
+
+        # print(f"Epoch {epoch+1:0>3d} eval: Val nll: {val_loss:.4f}, Val Accuracy: {val_metric}")
+    # best_model.load_state_dict(torch.load(path_to_project+ "/best_model.pth"))
+    return model
+
+
+def bias_corrected_marglik(la, dataset, train_loader, bias_correction, prior_precision, sigma_noise=None):
+    N = dataset.n_points
+    M = len(train_loader.dataset)
+    m = torch.arange(1, M + 1).to(device)
+    weighted_loss = 0
+    if prior_precision is not None:
+        la.prior_precision= prior_precision
+    assert(M<N)
+    if sigma_noise is not None:
+        if la.likelihood != 'regression':
+            raise ValueError('Can only change sigma_noise for regression.')
+        la.sigma_noise=sigma_noise
+
+
+    for batch_id, (data, target, acq_prob) in enumerate(train_loader):
+        if likelihood == "regression":
+            loss_helper = torch.nn.MSELoss(reduction="none")
+        elif likelihood == "classification":
+            # loss_helper = torch.nn.NLLLoss(reduction="none")
+            loss_helper= torch.nn.CrossEntropyLoss(reduction="none")
+        output = la.model(data)
+        raw_loss = loss_helper(output, target)
+
+        m_iter = m[batch_id * train_loader.batch_size: batch_id * train_loader.batch_size + len(acq_prob)]
+        if bias_correction == "none":
+            weight = 1
+        elif bias_correction == "pure":
+            weight = 1 / (N * acq_prob) + (M - m_iter) / N
+
+        elif bias_correction == "lure":
+            weight = 1 + (N - M) / (N - m_iter) * (1 / ((N - m_iter + 1) * acq_prob) - 1)
+            weight= torch.nan_to_num(weight, nan=1)
+        weighted_loss -= (weight * raw_loss).sum()
+    if likelihood == "regression":
+        log_likelihood = 0.5 * weighted_loss / (la.sigma_noise ** 2) - len(train_loader.dataset) * torch.log(
+            la.sigma_noise * math.sqrt(2 * math.pi))
+    elif likelihood == "classification":
+        log_likelihood = weighted_loss
+    bias_corrected_marg_lik = log_likelihood - 0.5 * (la.scatter + la.log_det_ratio)
+    return bias_corrected_marg_lik
+
+
+def marglik_training(model, dataset, type_loader, lr_param, lr_hyper, n_epochs, bias_correction, model_arch,
+                     likelihood, variational_samples, device, B, K, F,
+                     prior_init, temperature_init, sigma_init):
+    path_to_project= "/Users/victoriabarenne/ALbias"
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr_param, amsgrad=True)
+    best_marglik= np.inf
+    patience=0
+    best_model=model
+    backend= AsdlGGN if likelihood=="classification" else BackPackGGN
+
+    # Initializing all the hyperparameters and its hyper_optimizer
+    prior= torch.tensor([prior_init], dtype= torch.float32)
+    temperature= torch.tensor([temperature_init], dtype= torch.float32, requires_grad=True)
+    sigma= torch.tensor([sigma_init], dtype= torch.float32)
+    log_prior, log_sigma= torch.log(prior), torch.log(sigma)
+    log_prior.requires_grad, log_sigma.requires_grad= True, True
+
+    hyperparameters = [log_prior, log_sigma] if likelihood=="regression" else [log_prior]
+    hyper_optimizer = torch.optim.Adam(hyperparameters, lr=lr_hyper)
+
+    for epoch in range(n_epochs+1):
+        train_loader= dataset.get_loader(type= type_loader, batch_size=batch_size_train, model_arch=model_arch, laplace=False, variational_samples=variational_samples)
+        epoch_train_loss, epoch_train_acc= train_epoch(model, dataset, train_loader, optimizer, bias_correction, model_arch, hyperparameters, likelihood, variational_samples, device)
+
+        # scheduler.step()
+        if (epoch > B) & (epoch % F == 0):
+            la = Laplace(model, likelihood,
+                         hessian_structure=hessian_structure,
+                         sigma_noise=log_sigma.exp().to(device),
+                         prior_precision=log_prior.exp().to(device),
+                         temperature=temperature.to(device),
+                         subset_of_weights='all',
+                         backend=backend)
+            train_loader = dataset.get_loader(type= type_loader, batch_size=batch_size_train, model_arch=model_arch, laplace=True,
+                                                   variational_samples=variational_samples)
+            la.fit(train_loader)
+            for k in range(K):
+
+                hyper_optimizer.zero_grad()
+                noise = log_sigma.exp().to(device) if likelihood == "regression" else None
+                train_loader= dataset.get_loader(type=type_loader, batch_size=batch_size_train, model_arch=model_arch, laplace=False,
+                                                   variational_samples=variational_samples)
+                # neg_marglik_bis = -la.log_marginal_likelihood(log_prior.exp().to(device), noise)
+                neg_marglik= -bias_corrected_marglik( la, dataset, train_loader, bias_correction, log_prior.exp().to(device), noise)
+                neg_marglik.backward(retain_graph=True)
+                hyper_optimizer.step()
+            noise = log_sigma.exp().to(device) if likelihood == "regression" else None
+            # neg_marglik_bis = -la.log_marginal_likelihood(log_prior.exp().to(device), noise)
+            neg_marglik = -bias_corrected_marglik( la, dataset, train_loader, bias_correction, log_prior.exp().to(device), noise)
+            if neg_marglik < best_marglik:
+                torch.save(model.state_dict(), path_to_project + "/best_model.pth")
+                best_marglik = deepcopy(neg_marglik.item())
+                best_prior = deepcopy(la.prior_precision.cpu().detach().numpy())
+                if likelihood == "regression":
+                    best_sigma = deepcopy(la.sigma_noise.cpu().detach().numpy())
+            print(f"Epoch {epoch}: Training Loss {epoch_train_loss} Log MargLikelihood: {neg_marglik}")
+        # else:
+            # print(f"Epoch {epoch}: Training Loss {epoch_train_loss:.6f} Log MargLikelihood: not updated")
+    best_model.load_state_dict(torch.load(path_to_project + "/best_model.pth"))
+    if likelihood=="regression":
+        return best_model, best_marglik, best_prior, best_sigma
+    elif likelihood=="classification":
+        return best_model, best_marglik, best_prior, 0
+
+
+
+def compute_score(model, dataset, batch_size, device, acquisition_var_samples, model_arch):
+    """
+    Returns score for each available point in dataset,
+    mutual information between the output and the distribution theta (of the model)
+    """
+    available_loader= dataset.get_loader(type= "available", batch_size=batch_size, laplace=False, variational_samples=acquisition_var_samples, model_arch=model_arch)
+    model.eval()
+    model.to(device)
+    scores= np.array([])
+    for idx, (data, target, weight) in enumerate(available_loader):
+        data, target, weight= data.to(device), target.to(device), weight.to(device)
+        # Input preprocessing
+        output= model(data)
+        if model_arch=="radial_bnn":
+            output= torch.permute(output, (1, 0, 2)) #var_samples x batch_size x output_dim
+        else:
+            output= output.unsqueeze(0)
+
+        # Calculating the average entropy
+        average_entropy_i= -((output*output.exp()).sum(2)).mean(0) # batch_size
+        # Calculating the entropy average
+        mean_samples_i_c= (output.exp().sum(0)).log()- torch.log(torch.tensor([acquisition_var_samples]).to(device)) # batch_size x output_dim
+        entropy_average_i= -(mean_samples_i_c*mean_samples_i_c.exp()).sum(1) # batch_size
+
+        score= entropy_average_i- average_entropy_i
+        scores= np.concatenate((scores, score.cpu().detach().numpy()))
+        scores=torch.from_numpy(scores)
+
+        if torch.any(torch.isnan(scores)):
+            scores = torch.nan_to_num(scores, nan=0.0)
+        scores[scores<0]=0
+    return scores
+

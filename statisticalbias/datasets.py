@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import random
 import torchvision
-from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data import DataLoader, Dataset
 from torchvision.transforms import ToTensor, Normalize, Compose
 import torch
 
@@ -47,6 +47,23 @@ class WeightedSubset(Dataset):
 
         return data, self.targets[item], weights
 
+class Subset(Dataset):
+    def __init__(self, dataset, idx, unsqueeze=False, transform= None):
+        self.data = dataset.data[idx]
+        if unsqueeze:
+            self.data = self.data.float().unsqueeze(1)
+        self.targets = dataset.targets[idx]
+        assert((len(self.data)==len(self.targets))&(len(self.data) == len(idx)))
+        self.transform= transform
+    def __len__(self):
+        return len(self.data)
+    def __getitem__(self, item):
+        if self.transform:
+            data= self.transform(self.data[item].float())
+        else:
+            data= self.data[item].float()
+
+        return data, self.targets[item]
 
 class ActiveLearningDataset(Dataset):
     def __init__(self, n_points, random_state):
@@ -101,7 +118,7 @@ class ActiveMNIST(ActiveLearningDataset):
         self.mnist= torchvision.datasets.MNIST(root="",
                                                      train=train,
                                                      transform= Compose([ToTensor(), Normalize((0.1307,), (0.3081,))]),
-                                                     download=False)
+                                                     download=True)
 
         if random_state is not None:
             state = np.random.get_state()
@@ -155,13 +172,42 @@ class ActiveMNIST(ActiveLearningDataset):
         self.acq_prob = torch.tensor([])
 
 
-    def get_trainloader(self, batch_size):
-        train_loader = DataLoader(self.train, batch_size=batch_size, shuffle=True)
-        return train_loader
+    def get_loader(self, type: str, batch_size, model_arch, laplace, variational_samples= None):
+        if type=="train":
+            initial_dataset= self.train
+        elif type=="available":
+            initial_dataset= self.available
+        elif type=="validation":
+            initial_dataset=self.available
+        if laplace:
+            if model_arch== "radial_bnn":
+                dataset = Subset(initial_dataset, np.arange(len(initial_dataset)), unsqueeze=True)
+                dataset.data = dataset.data.expand((-1, variational_samples, -1, -1, -1))
+            elif model_arch=="mlp":
+                dataset= Subset(initial_dataset, np.arange(len(initial_dataset)), unsqueeze=False)
+                dataset.data= dataset.data.view(dataset.data.shape[0], -1)
+            elif model_arch=="cnn":
+                dataset= Subset(initial_dataset, np.arange(len(initial_dataset)), unsqueeze=False)
+            elif model_arch=="resnet":
+                dataset= Subset(initial_dataset, np.arange(len(initial_dataset)), unsqueeze=False, transform= torchvision.transforms.Resize(224))
+                dataset.data = dataset.data.expand((-1, 3, -1, -1)) # to the right number of channels for the resnet network
+        else:
+            if model_arch=="radial_bnn":
+                dataset= WeightedSubset(initial_dataset, np.arange(len(initial_dataset)), initial_dataset.weights, unsqueeze= True)
+                dataset.data = dataset.data.expand((-1, variational_samples, -1, -1, -1))
+            elif model_arch=="mlp":
+                dataset= WeightedSubset(initial_dataset, np.arange(len(initial_dataset)), initial_dataset.weights, unsqueeze= False)
+                dataset.data= dataset.data.view(dataset.data.shape[0], -1)
+            elif model_arch=="cnn":
+                dataset= WeightedSubset(initial_dataset, np.arange(len(initial_dataset)), initial_dataset.weights, unsqueeze= False)
+            elif model_arch == "resnet":
+                dataset = WeightedSubset(initial_dataset, np.arange(len(initial_dataset)), initial_dataset.weights, unsqueeze=False, transform=torchvision.transforms.Resize(224))
+                dataset.data = dataset.data.expand((-1, 3, -1, -1))  # to the right number of channels for the resnet network
 
-    def get_availableloader(self, batch_size):
-        available_loader = DataLoader(self.available, batch_size=batch_size, shuffle=True)
-        return available_loader
+        dataset.targets= dataset.targets.long()
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+        return loader
+
 
     def observe(self, idx, prob, idx_absolute=True):
         self.labeled[idx] = 1

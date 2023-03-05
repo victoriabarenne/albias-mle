@@ -3,7 +3,6 @@ import torch
 import matplotlib.pyplot as plt
 import numpy as np
 from MLEestimation.training import train_model, train_epoch_model, mle_training
-
 import os
 import pandas as pd
 import json
@@ -71,10 +70,11 @@ def mle_plotting(run_name, model, train_loader, likelihood, n_epochs, lr_param, 
     la, model, neg_margliks, training_losses, perf_metrics, all_hyperparameters= mle_training(model, train_loader, likelihood, n_epochs, lr_param, lr_hyper,
                                                                                               F, B, K, hessian_structure,
                                                                                               device, prior_init, sigma_init, temperature_init)
+    new_margliks = np.concatenate((np.zeros(B), np.repeat(neg_margliks, F)))
 
 
-    plt.plot(neg_margliks)
-    plt.title(f"Negative log marginal likelihood (lowest: {min(neg_margliks):.2f})")
+    plt.plot(np.arange(B+1, n_epochs+1), new_margliks[B:])
+    plt.title(f"Negative log marginal likelihood")
     plt.savefig(path_to_run + "neg_margliks.png")
     plt.show()
 
@@ -91,11 +91,18 @@ def mle_plotting(run_name, model, train_loader, likelihood, n_epochs, lr_param, 
     plt.savefig(path_to_run + "metrics.png")
     plt.show()
 
-    df = pd.DataFrame(data={"losses": training_losses, "margliks": neg_margliks, "metrics": perf_metrics, "prior_prec": all_hyperparameters[:,0], "sigma": all_hyperparameters[:,1]})
+    df = pd.DataFrame(data={"losses": training_losses, "margliks": new_margliks, "metrics": perf_metrics})
     df.to_csv(path_to_run + "tracking.csv", sep=',', index=False)
 
+    if likelihood=="regression":
+        df_hyper= pd.DataFrame(data= {"prior": all_hyperparameters[:,0], "posterior_param": all_hyperparameters[:,1]})
+    elif likelihood=="regression":
+        df_hyper= pd.DataFrame(data= {"prior": all_hyperparameters[:,0]})
+
+    df_hyper.to_csv(path_to_run + "hyperparam_tracking.csv", sep=',', index=False)
+
     dict = {"n_epochs": n_epochs, 'lr_param': lr_param, "lr_hyper": lr_hyper, "hessian_structure": hessian_structure,
-            "prior_prec_init": prior_init, "sigma_noise_init": sigma_init,
+            "F": F, "B": B, "K": K, "prior_prec_init": prior_init, "sigma_noise_init": sigma_init,
             "temperature": temperature_init}
     json.dump(dict, open(path_to_run + "hyperparameters.json", 'w'))
 

@@ -26,10 +26,25 @@ def mnist_dataloader(train: bool, batch_size:int):
   dataset = torchvision.datasets.MNIST(root="", train=train, transform=ToTensor(), download=True)
   x, y= dataset.data, dataset.targets
   x= x.view(x.size(0), -1)
-  # y= y.view(y.size(0), -1)
   x, y= x.to(torch.float32), y.to(torch.long)
-  # x= x.unsqueeze(1)
   dataset= TensorDataset(x, y)
   dataloader= DataLoader(dataset, batch_size= batch_size)
   return dataloader
+
+def dataloader_classification(name: "str", train: bool, batch_size:int):
+  if name== "CIFAR10":
+    dataset = torchvision.datasets.CIFAR10(root="", train=train, transform=ToTensor(), download=True)
+  elif name=="CIFAR100":
+    dataset = torchvision.datasets.CIFAR100(root="", train=train, transform=ToTensor(), download=True)
+  elif name == "FMNIST":
+    dataset = torchvision.datasets.FashionMNIST(root="", train=train, transform=ToTensor(), download=True)
+  elif name == "MNIST":
+    dataset = torchvision.datasets.MNIST(root="", train=train, transform=ToTensor(), download=True)
+  x, y= dataset.data, dataset.targets
+  x= x.view(x.size(0), -1)
+  x, y= x.to(torch.float32), y.to(torch.long)
+  dataset= TensorDataset(x, y)
+  dataloader= DataLoader(dataset, batch_size= batch_size)
+  return dataloader
+
 

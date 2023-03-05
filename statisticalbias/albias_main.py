@@ -1,30 +1,20 @@
-import matplotlib.pyplot as plt
 import numpy as np
-from sklearn.metrics import mean_squared_error
-from sklearn.linear_model import LinearRegression
-from sklearn.metrics import mean_squared_error
 from IPython import embed
-import seaborn as sns
-import torchvision
 import pandas as pd
 from torch.utils.data import Subset
 from datasets import ActiveMNIST
-import copy
+from MLEestimation.models import MLP
 import torch
-from radial_layers.loss import Elbo
-from models import BNN_variational, RadialBNN
-import torch.nn as nn
-from torch.utils.tensorboard import SummaryWriter
+from statisticalbias.radial_layers.loss import Elbo
+from models import RadialBNN, MLP_dropout
 import wandb
 import torch.nn.functional as F
 import math
-from sacred import Experiment
-from sacred.observers import FileStorageObserver
 from copy import deepcopy
 
 # torch.cuda.empty_cache()
 
-def train_epoch(model, dataset, train_loader, loss, optimizer, bias_correction, variational_samples=8, device="cpu"):
+def train_epoch(model, dataset, train_loader, optimizer, bias_correction, model_arch: str, variational_samples=8, device="cpu"):
     '''
     Trains model for one epoch
     N: len(dataset.all)
@@ -36,26 +26,33 @@ def train_epoch(model, dataset, train_loader, loss, optimizer, bias_correction, 
     M= len(train_loader.dataset)
     m= torch.arange(1, M+1).to(device)
     accuracy=0
+    if model_arch=="radial_bnn":
+        loss = Elbo(binary=False, regression=False)
+        loss.set_model(model, train_loader.batch_size)
+        loss.set_num_batches(len(train_loader))
+
+        def loss_helper(prediction, target):
+            nll_loss, kl_loss = loss.compute_loss(prediction, target)
+            # TODO: regulazing term can be changed? (to other than 1/10)
+            return nll_loss + kl_loss / 10
+    else:
+        loss_helper= torch.nn.NLLLoss(reduction="none")
 
     for batch_id, (data, target, acq_prob) in enumerate(train_loader):
         optimizer.zero_grad()
         # zero the parameter gradients
         data, target, acq_prob = data.to(device), target.to(device), acq_prob.to(device)
-        # change input to variational
-        data = data.unsqueeze(1)
-        data = data.expand((-1, variational_samples, -1, -1, -1))
-        data= data.float()
-        output = model(data)
-        output = output.squeeze()
+        if model_arch=="radial_bnn":
+            data = data.unsqueeze(1)
+            data = data.expand((-1, variational_samples, -1, -1, -1))
+            data= data.float()
+        else:
+            data = data.view(data.size(0), -1)
 
-        def loss_helper(prediction, target):
-            nll_loss, kl_loss = loss.compute_loss(prediction, target)
-            #TODO: regulazing term can be changed? (to other than 1/10)
-            return nll_loss + kl_loss / 10
+        output = model(data) #shape batch_size x var_samples x n_output for radial_bnn, #batch_size x n_output otherwise
+        raw_loss = loss_helper(output, target)
 
         m_iter= m[batch_id*train_loader.batch_size: batch_id*train_loader.batch_size + len(acq_prob)]
-        raw_loss= loss_helper(output, target)
-
         if bias_correction== "none":
             weight= 1
         elif bias_correction=="pure":
@@ -63,7 +60,11 @@ def train_epoch(model, dataset, train_loader, loss, optimizer, bias_correction, 
         elif bias_correction== "lure":
             weight= 1 + (N-M)/(N-m_iter)*(1/((N-m_iter+1)*acq_prob)-1)
         batch_loss= (weight*raw_loss).mean(0)
-        accuracy+= torch.sum(torch.argmax(output.mean(dim=1), dim= 1)==target).item()
+
+        if model_arch=="radial_bnn":
+            accuracy+= torch.sum(torch.argmax(output.mean(dim=1), dim= 1)==target).item()
+        else:
+            accuracy += torch.sum(torch.argmax(output, dim=1) == target).item()
 
         batch_loss.backward()
         optimizer.step()
@@ -74,25 +75,18 @@ def train_epoch(model, dataset, train_loader, loss, optimizer, bias_correction, 
     return epoch_loss, accuracy/len(train_loader.dataset)
 
 
-def train_all(model, dataset, train_loader, val_loader, n_epochs, learning_rate, bias_correction, early_stopping=20, variational_samples=8, device="cpu"):
+def train_all(model, dataset, train_loader, val_loader, n_epochs, learning_rate, bias_correction, model_arch, early_stopping, variational_samples, device="cpu"):
     path_to_project= "/Users/victoriabarenne/ALbias"
-    loss = Elbo(binary=False, regression=False)
-    loss.set_model(model, train_loader.batch_size)
-    loss.set_num_batches(len(train_loader))
 
-    train_losses, val_losses, train_accuracies, val_accuracies= np.array([], dtype=float), np.array([], dtype=float), np.array([], dtype=float), np.array([], dtype=float)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, amsgrad=True)
     best_loss= np.inf
     patience=0
     best_model=model
 
     for epoch in range(n_epochs):
-        train_loss, train_acc= train_epoch(model, dataset, train_loader, loss, optimizer, bias_correction, variational_samples, device)
+        train_loss, train_acc= train_epoch(model, dataset, train_loader, optimizer, bias_correction, model_arch, variational_samples, device)
         val_loss, _, val_acc = evaluate(model, val_loader, device, variational_samples, "none")
-        train_losses= np.append(train_losses, train_loss)
-        train_accuracies= np.append(train_accuracies, train_acc)
-        val_losses= np.append(val_losses, val_loss)
-        val_accuracies= np.append(val_accuracies, val_acc)
+
         # wandb.log({f"{logging_name}_tl": train_loss, f"{logging_name}_ta": train_acc,
         #            f"{logging_name}_vl": val_loss, f"{logging_name}_va": val_acc})
 
@@ -111,8 +105,10 @@ def train_all(model, dataset, train_loader, val_loader, n_epochs, learning_rate,
     best_model.load_state_dict(torch.load(path_to_project+ "/best_model.pth"))
     return best_model
 
+
 def evaluate(model, eval_loader, device, variational_samples, bias_correction):
-    model.train()
+    # model.train()
+    model.eval()
     model.to(device)
 
     val_nll= 0
@@ -123,23 +119,21 @@ def evaluate(model, eval_loader, device, variational_samples, bias_correction):
     M = len(eval_loader.dataset)
     m= torch.arange(1, M+1).to(device)
 
-    loss = Elbo(binary=False, regression=False)
-    loss.set_model(model, eval_loader.batch_size)
-    loss.set_num_batches(len(eval_loader))
-
     for batch_id, (data, target, acq_prob) in enumerate(eval_loader):
-        # zero the parameter gradients
         data, target, acq_prob = data.to(device), target.to(device), acq_prob.to(device)
-        # change input to variational
-        data = data.unsqueeze(1)
-        data = data.expand((-1, variational_samples, -1, -1, -1))
-        output = model(data)
-        output = output.squeeze()
+        if model_arch=="radial_bnn":
+            data = data.unsqueeze(1)
+            data = data.expand((-1, variational_samples, -1, -1, -1))
+            output = model(data)
+            output = output.squeeze()
+            prediction = torch.logsumexp(output, dim=1) - math.log(variational_test_train)
+        else:
+            output = torch.stack([model(data.view(data.size(0), -1)) for _ in range(variational_test_train)])
+            prediction = torch.logsumexp(output, dim=0) - math.log(variational_test_train)
+            # data = data.view(data.size(0), -1)
+            # prediction = model(data)
+            # prediction = torch.logsumexp(output)
 
-        #DEAL WITH RAW LOSS
-        #TODO: review raw loss
-        #prediction= log(mean(exp(output), dim=-1)) ie mean over the variational samples
-        prediction = torch.logsumexp(output, dim=1) - math.log(variational_test_train)
         raw_loss= F.nll_loss(prediction, target, reduction="none")
         m_iter= m[batch_id*eval_loader.batch_size: batch_id*eval_loader.batch_size + len(acq_prob)]
 
@@ -175,12 +169,15 @@ def compute_score(model, dataset, batch_size, device, acquisition_var_samples):
     for idx, (data, target, weight) in enumerate(available_loader):
         data, target, weight= data.to(device), target.to(device), weight.to(device)
         # Input preprocessing
-        data= data.unsqueeze(1)
-        data = data.expand((-1, acquisition_var_samples, -1, -1, -1))
-
-        # Output
-        output= model(data)
-        output= torch.permute(output, (1, 0, 2)) #var_samples x batch_size x output_dim
+        if model_arch=="radial_bnn":
+            data= data.unsqueeze(1)
+            data = data.expand((-1, acquisition_var_samples, -1, -1, -1))
+            output= model(data)
+            output= torch.permute(output, (1, 0, 2)) #var_samples x batch_size x output_dim
+        else:
+            data = data.view(data.size(0), -1)
+            output= model(data)
+            output= output.unsqueeze(0)
 
         # Calculating the average entropy
         average_entropy_i= -((output*output.exp()).sum(2)).mean(0) # batch_size
@@ -197,10 +194,10 @@ def compute_score(model, dataset, batch_size, device, acquisition_var_samples):
         scores[scores<0]=0
     return scores
 
-track=False
-project_name="ALbias_fixed"
-run_name= "test_cluster_5"
-batch_size=128
+track=True
+project_name="ALbias_MLP"
+run_name= "test1"
+batch_size=64
 batch_size_evaluate= 512
 batch_size_scores= 32
 n_epochs=100 #100
@@ -215,6 +212,8 @@ initial_pool=10
 goal_points=70 #70
 training_frequency=3 #3
 B=0
+n_layers=3
+model_arch= f"MLP_{n_layers}layers"
 
 if track ==True:
     wandb.init(
@@ -223,7 +222,7 @@ if track ==True:
         # track hyperparameters and run metadata
         config={
             "learning_rate": learning_rate,
-            "architecture": "CNN",
+            "architecture": model_arch,
             "dataset": "Unbalanced MNIST",
             "epochs": n_epochs,
             "early_stopping_epochs":early_stopping_epochs,
@@ -240,12 +239,15 @@ if track ==True:
         }
     )
 
+
+
 #0) Initialize model and training/testing datasets
 dataset= ActiveMNIST(noise_ratio= 0.1, p_train=0.15, train=True, unbalanced= True, random_state=2) # unbalanced MNIST
 dataset_testing= ActiveMNIST(noise_ratio=0, p_train=1, train=False, unbalanced= True, random_state=1)
+
+
 val_loader = torch.utils.data.DataLoader(dataset.validation, batch_size=batch_size_evaluate, shuffle=True)
 df_testing= pd.DataFrame(columns=["none", "pure", "lure"])
-N_test= dataset_testing.n_points
 train_losses, val_losses, train_accuracies, val_accuracies= np.array([]), np.array([]), np.array([]), np.array([])
 
 # 1) Initialize using 10 random samples from the training data pool
@@ -256,7 +258,9 @@ n_acquired= 0
 
 while ((len(dataset.queries)<goal_points)):
     # 2) Train model using Dtrain and R_tilde loss
-    model_acquisition = RadialBNN(16)
+    # model_acquisition = RadialBNN(16)
+    model_acquisition= MLP(n_hidden_layers=n_layers, n_in= 784, n_out=10)
+    # model_acquisition= MLP_dropout(n_layers=n_layers, p=0.5, n_in= 784, n_out=10)
     train_loader= dataset.get_trainloader(batch_size)
     model_acquisition= train_all(model_acquisition, dataset, train_loader, val_loader, n_epochs, learning_rate, "none",
               early_stopping_epochs, variational_test_train, device)
@@ -270,14 +274,17 @@ while ((len(dataset.queries)<goal_points)):
 
     # 4) Train models using only the training data using no bias-correction, pure, and lure correction every 3 aquisition rounds
     if (n_acquired==training_frequency) & (len(dataset.queries) > B):
-        model_none, model_pure, model_lure= RadialBNN(16), RadialBNN(16), RadialBNN(16)
+        # model_none, model_pure, model_lure= RadialBNN(16), RadialBNN(16), RadialBNN(16)
+        model_none, model_pure, model_lure= MLP(n_hidden_layers=n_layers, n_in= 784, n_out=10), MLP(n_hidden_layers=n_layers, n_in= 784, n_out=10), MLP(n_hidden_layers=n_layers, n_in= 784, n_out=10)
+        # model_none, model_pure, model_lure= MLP_dropout(n_layers=n_layers, p=0.5, n_in=784, n_out=10), MLP_dropout(n_layers=n_layers, p=0.5, n_in= 784, n_out=10), MLP_dropout(n_layers=n_layers, p=0.5, n_in= 784, n_out=10)
+
         train_loader = dataset.get_trainloader(batch_size)
         model_none = train_all(model_none, dataset, train_loader, val_loader, n_epochs, learning_rate, "none",
-                               early_stopping_epochs, variational_test_train, device)
+                               model_arch, early_stopping_epochs, variational_test_train, device)
         model_pure= train_all(model_pure, dataset, train_loader, val_loader, n_epochs, learning_rate, "pure",
-                                                      early_stopping_epochs, variational_test_train, device)
+                              model_arch, early_stopping_epochs, variational_test_train, device)
         model_lure= train_all(model_lure, dataset, train_loader, val_loader, n_epochs, learning_rate, "lure",
-                                                      early_stopping_epochs, variational_test_train, device)
+                              model_arch, early_stopping_epochs, variational_test_train, device)
         n_acquired = 0
         # 5) Evaluate the models using the test set (to get the bias)
         def my_function(model, name):
@@ -302,8 +309,9 @@ while ((len(dataset.queries)<goal_points)):
 
     # 3) Select the next acquisition point
     scores= compute_score(model_acquisition, dataset, batch_size_scores, device, variational_scoring)
+    # print("scores", scores.min(), scores.max(), scores.mean() )
     q_proposal= torch.nn.Softmax(dim=0)(temperature * scores)
-    print(q_proposal.sum())
+    # print(q_proposal.sum(), q_proposal.min(), q_proposal.max(), q_proposal.mean())
     id = torch.multinomial(q_proposal, num_samples=points_per_acquisition, replacement=False)
     prob = q_proposal[id]
     #TODO: implement such that we don't observe the same point twice
@@ -313,4 +321,6 @@ while ((len(dataset.queries)<goal_points)):
     np.save("/Users/victoriabarenne/ALbias/weights5.npy", dataset.train.weights)
     np.save("/Users/victoriabarenne/ALbias/idx5.npy", dataset.queries)
 
-embed()
+if track==True:
+    wandb.finish(exit_code=0)
+
