@@ -29,7 +29,7 @@ variational_samples, variational_samples_acquisition= 8, 100
 device= "cpu"
 hessian_structure="kron"
 model_arch="mlp" # or "radial_bnn", "mlp_complex"
-initial_pool=30
+initial_pool=10
 goal_points=70
 
 B, K, F= 0, 1, 1

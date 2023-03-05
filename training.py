@@ -50,6 +50,7 @@ def train_epoch(model, dataset, train_loader, loss_helper, optimizer, bias_corre
             loglik= -(weight*raw_loss).sum(0)
             # loglik= -(weight*raw_loss).mean(0)
         batch_loss= -loglik + 0.5*prior_precision*(theta@theta)*len(target)/M
+        # batch_loss= -loglik + 0.5*prior_precision*(theta@theta)
 
         if likelihood=="classification":
             epoch_metric += torch.sum(torch.argmax(output, dim=1) == target).item()
@@ -62,8 +63,6 @@ def train_epoch(model, dataset, train_loader, loss_helper, optimizer, bias_corre
         # print statistics
         epoch_loss += batch_loss.item()
         epoch_loglik+= loglik.item()
-    # return epoch_loss/ len(train_loader)
-    # return epoch_loss/len(train_loader.dataset), epoch_metric/len(train_loader.dataset), epoch_loglik/len(train_loader.dataset)
 
 def evaluate(la, model, test_loader, model_arch, likelihood="classification", variational_samples=8, device="cpu"):
     # model.train()
@@ -84,7 +83,6 @@ def evaluate(la, model, test_loader, model_arch, likelihood="classification", va
             prediction = torch.logsumexp(output, dim=0) - math.log(variational_samples)
 
         raw_loss= loss_helper(prediction, target).squeeze()
-        # test_loss+=raw_loss.sum().item()
         test_loss += raw_loss.mean().item()
         if likelihood=="regression":
             test_metric+= torch.sum((output-target)**2).item()
@@ -95,7 +93,7 @@ def evaluate(la, model, test_loader, model_arch, likelihood="classification", va
         neg_marglik= test_loss/(2*la.sigma_noise**2)/len(test_loader) +0.5*(la.scatter+la.log_det_ratio)
     if likelihood=="classification":
         neg_marglik= test_loss/len(test_loader)+0.5*(la.scatter+la.log_det_ratio)
-    # return eval_loss/len(eval_loader)
+
     return test_loss/len(test_loader), test_metric/len(test_loader.dataset), -neg_marglik
 
 
@@ -136,16 +134,17 @@ def train_epoch_marglik(la, dataset, train_loader, loss_helper, hyper_optimizer,
         elif bias_correction == "lure":
             weight = 1 + (N - M) / (N - m_iter) * (1 / ((N - m_iter + 1) * acq_prob) - 1)
             weight= torch.nan_to_num(weight, nan=1)
-        weighted_loss= (weight*raw_loss).mean(0)
         if likelihood == "regression":
-            loglik= -0.5*weighted_loss/(la.sigma_noise**2)- 0.5*len(target) * torch.log(la.sigma_noise * math.sqrt(2 * math.pi))
+            # loglik= -0.5*(weight*raw_loss).mean(0)/(la.sigma_noise**2)- 0.5*len(target) * torch.log(la.sigma_noise * math.sqrt(2 * math.pi))
+            loglik= -0.5*(weight*(raw_loss/(la.sigma_noise**2)+ len(target)* torch.log(la.sigma_noise * math.sqrt(2 * math.pi)))).mean(0)
         elif likelihood=="classification":
-            loglik= -weighted_loss
+            loglik= -(weight*raw_loss).mean(0)
         batch_loss_marglik= -loglik + 0.5 * (la.scatter + la.log_det_ratio)
         batch_loss_marglik.backward(retain_graph=True)
         hyper_optimizer.step()
         epoch_loss += batch_loss_marglik.item()
-    return epoch_loss / len(train_loader)
+
+        return epoch_loss/len(train_loader)
 
 
 
